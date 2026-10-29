@@ -1,0 +1,3352 @@
+
+
+========== app\main.py ==========
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException
+
+from app.schemas import (
+    ClientProfile,
+    GoalPlanRequest,
+    SuitabilityRequest,
+    RecommendationDraft,
+    ApprovalAction,
+)
+
+from app.risk import assess_risk
+from app.goals import build_goal_plan, glide_path
+from app.guardrails import check_suitability
+from app.workflow import store
+
+# Database imports
+from app.database import Base, engine
+from app import models
+
+# Client and financial goal management
+from app.client_service import router as clients_router
+from app.goal_service import router as goal_management_router
+
+# RAG imports
+from app.rag.api import (
+    router as research_router,
+    fund_retriever,
+)
+from app.rag.document_loader import load_pdf
+from app.advisory_service import router as advisory_workflow_router
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Load and index the mutual fund factsheet at startup."""
+
+    project_root = Path(__file__).resolve().parent.parent
+
+    pdf_path = (
+        project_root
+        / "data"
+        / "fund_documents"
+        / "HDFC_MF_Factsheet.pdf"
+    )
+
+    if not pdf_path.exists():
+        print(
+            "FinPilot AI: factsheet not found at "
+            f"{pdf_path.resolve()}"
+        )
+    else:
+        try:
+            pages = load_pdf(str(pdf_path))
+            chunk_count = fund_retriever.index_pages(pages)
+
+            print(
+                "FinPilot AI: indexed "
+                f"{chunk_count} fund-document chunks."
+            )
+
+        except Exception as exc:
+            print(
+                "FinPilot AI: document indexing failed: "
+                f"{exc}"
+            )
+
+    yield
+
+
+app = FastAPI(
+    title="FinPilot AI Core",
+    version="0.4.0",
+    description=(
+        "Adviser-controlled investment planning with "
+        "evidence-grounded mutual fund research, "
+        "persistent client management, and financial goal tracking."
+    ),
+    lifespan=lifespan,
+)
+
+
+# --------------------------------------------------
+# DATABASE INITIALIZATION
+# --------------------------------------------------
+
+# Register SQLAlchemy models and create missing tables.
+Base.metadata.create_all(bind=engine)
+
+
+# --------------------------------------------------
+# REGISTER ROUTERS
+# --------------------------------------------------
+
+app.include_router(research_router)
+app.include_router(clients_router)
+app.include_router(goal_management_router)
+app.include_router(advisory_workflow_router)
+
+# --------------------------------------------------
+# HEALTH CHECK
+# --------------------------------------------------
+
+@app.get("/health", tags=["System"])
+def health():
+    """Check whether the backend is running."""
+
+    return {
+        "status": "ok",
+        "service": "finpilot-core",
+        "version": "0.4.0",
+    }
+
+
+# --------------------------------------------------
+# RISK ASSESSMENT
+# --------------------------------------------------
+
+@app.post("/risk/assess", tags=["Risk Assessment"])
+def risk_assess(profile: ClientProfile):
+    """Assess a client's investment risk profile."""
+
+    return assess_risk(profile)
+
+
+# --------------------------------------------------
+# FINANCIAL GOAL PLANNING
+# --------------------------------------------------
+
+@app.post("/goals/plan", tags=["Financial Goals"])
+def goals_plan(request: GoalPlanRequest):
+    """Calculate a financial goal plan without saving it."""
+
+    return build_goal_plan(request)
+
+
+@app.get("/goals/glide-path", tags=["Financial Goals"])
+def goals_glide_path(
+    start_equity_pct: float = 60,
+    years_to_goal: int = 10,
+):
+    """Generate an illustrative equity allocation glide path."""
+
+    if not 0 <= start_equity_pct <= 100:
+        raise HTTPException(
+            status_code=400,
+            detail="start_equity_pct must be between 0 and 100",
+        )
+
+    if not 1 <= years_to_goal <= 60:
+        raise HTTPException(
+            status_code=400,
+            detail="years_to_goal must be between 1 and 60",
+        )
+
+    return {
+        "glide_path": glide_path(
+            start_equity_pct,
+            years_to_goal,
+        )
+    }
+
+
+# --------------------------------------------------
+# INVESTMENT SUITABILITY
+# --------------------------------------------------
+
+@app.post("/suitability/check", tags=["Suitability"])
+def suitability_check(request: SuitabilityRequest):
+    """Check a proposed investment against suitability rules."""
+
+    return check_suitability(request)
+
+
+# --------------------------------------------------
+# ADVISER RECOMMENDATION WORKFLOW
+# --------------------------------------------------
+
+@app.post("/adviser/drafts", tags=["Adviser Workflow"])
+def create_draft(draft: RecommendationDraft):
+    """Create a recommendation draft."""
+
+    return store.create_draft(draft)
+
+
+@app.post(
+    "/adviser/drafts/{draft_id}/submit",
+    tags=["Adviser Workflow"],
+)
+def submit_draft(draft_id: str):
+    """Submit a recommendation draft for adviser review."""
+
+    try:
+        return store.submit_for_review(draft_id)
+
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        )
+
+
+@app.post(
+    "/adviser/drafts/{draft_id}/decision",
+    tags=["Adviser Workflow"],
+)
+def decide_draft(
+    draft_id: str,
+    action: ApprovalAction,
+):
+    """Record an adviser approval or rejection decision."""
+
+    try:
+        return store.decide(draft_id, action)
+
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        )
+
+
+@app.get("/adviser/audit-log", tags=["Adviser Workflow"])
+def audit_log():
+    """Retrieve adviser workflow audit events."""
+
+    return {
+        "events": store.audit_log,
+    }
+
+
+========== app\client_service.py ==========
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel, ConfigDict, Field, EmailStr
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from app.database import get_db
+from app.models import Client
+
+router = APIRouter(prefix="/clients", tags=["Client Management"])
+
+
+class ClientCreate(BaseModel):
+    full_name: str = Field(..., min_length=2, max_length=100)
+    email: EmailStr | None = None
+    phone: str | None = Field(default=None, max_length=20)
+
+    age: float | None = Field(default=None, gt=0, le=120)
+    occupation: str | None = Field(default=None, max_length=100)
+
+    annual_income: float | None = Field(default=None, ge=0)
+    monthly_expenses: float | None = Field(default=None, ge=0)
+    existing_investments: float | None = Field(default=None, ge=0)
+    emergency_fund: float | None = Field(default=None, ge=0)
+
+    financial_notes: str | None = None
+
+
+class ClientUpdate(BaseModel):
+    full_name: str | None = Field(default=None, min_length=2, max_length=100)
+    email: EmailStr | None = None
+    phone: str | None = Field(default=None, max_length=20)
+
+    age: float | None = Field(default=None, gt=0, le=120)
+    occupation: str | None = Field(default=None, max_length=100)
+
+    annual_income: float | None = Field(default=None, ge=0)
+    monthly_expenses: float | None = Field(default=None, ge=0)
+    existing_investments: float | None = Field(default=None, ge=0)
+    emergency_fund: float | None = Field(default=None, ge=0)
+
+    financial_notes: str | None = None
+
+
+class ClientResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    full_name: str
+    email: str | None
+    phone: str | None
+    age: float | None
+    occupation: str | None
+
+    annual_income: float | None
+    monthly_expenses: float | None
+    existing_investments: float | None
+    emergency_fund: float | None
+
+    risk_profile: str | None
+    financial_notes: str | None
+
+
+@router.post(
+    "",
+    response_model=ClientResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_client(
+    request: ClientCreate,
+    db: Session = Depends(get_db),
+):
+    client = Client(**request.model_dump())
+
+    db.add(client)
+
+    try:
+        db.commit()
+        db.refresh(client)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="A client with this email already exists.",
+        )
+
+    return client
+
+
+@router.get("", response_model=list[ClientResponse])
+def list_clients(db: Session = Depends(get_db)):
+    return db.query(Client).order_by(Client.full_name).all()
+
+
+@router.get("/{client_id}", response_model=ClientResponse)
+def get_client(
+    client_id: str,
+    db: Session = Depends(get_db),
+):
+    client = db.get(Client, client_id)
+
+    if client is None:
+        raise HTTPException(status_code=404, detail="Client not found.")
+
+    return client
+
+
+@router.patch("/{client_id}", response_model=ClientResponse)
+def update_client(
+    client_id: str,
+    request: ClientUpdate,
+    db: Session = Depends(get_db),
+):
+    client = db.get(Client, client_id)
+
+    if client is None:
+        raise HTTPException(status_code=404, detail="Client not found.")
+
+    changes = request.model_dump(exclude_unset=True)
+
+    for field, value in changes.items():
+        setattr(client, field, value)
+
+    try:
+        db.commit()
+        db.refresh(client)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="A client with this email already exists.",
+        )
+
+    return client
+
+
+@router.delete("/{client_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_client(
+    client_id: str,
+    db: Session = Depends(get_db),
+):
+    client = db.get(Client, client_id)
+
+    if client is None:
+        raise HTTPException(status_code=404, detail="Client not found.")
+
+    db.delete(client)
+    db.commit()
+
+
+========== app\goal_service.py ==========
+import json
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy.orm import Session
+
+from app.database import get_db
+from app.models import Client, FinancialGoal
+from app.goals import build_goal_plan
+from app.schemas import GoalPlan, GoalPlanRequest
+
+
+router = APIRouter(
+    prefix="/clients/{client_id}/goals",
+    tags=["Financial Goal Management"],
+)
+
+
+class FinancialGoalCreate(GoalPlanRequest):
+    """Request to create and calculate a persistent financial goal."""
+
+    pass
+
+
+class FinancialGoalUpdate(BaseModel):
+    """Fields that can be updated on an existing goal."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    goal_name: str | None = Field(default=None, min_length=1, max_length=120)
+    current_goal_cost_inr: float | None = Field(default=None, gt=0)
+    years_to_goal: int | None = Field(default=None, ge=1, le=60)
+    current_goal_savings_inr: float | None = Field(default=None, ge=0)
+    monthly_contribution_inr: float | None = Field(default=None, ge=0)
+    annual_inflation_assumption: float | None = Field(
+        default=None, ge=0, le=0.20
+    )
+    annual_return_assumption: float | None = Field(
+        default=None, ge=0, le=0.30
+    )
+
+
+class FinancialGoalResponse(BaseModel):
+    """A persisted goal and its latest calculated plan."""
+
+    id: str
+    client_id: str
+    goal_name: str
+    current_goal_cost_inr: float
+    years_to_goal: int
+    current_goal_savings_inr: float
+    monthly_contribution_inr: float | None
+    annual_inflation_assumption: float
+    annual_return_assumption: float
+    plan: dict[str, Any] | None
+
+
+def get_client_or_404(db: Session, client_id: str) -> Client:
+    client = db.get(Client, client_id)
+
+    if client is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Client not found.",
+        )
+
+    return client
+
+
+def serialize_goal(goal: FinancialGoal) -> dict:
+    """Convert a database goal to a JSON-compatible response."""
+
+    return {
+        "id": goal.id,
+        "client_id": goal.client_id,
+        "goal_name": goal.goal_name,
+        "current_goal_cost_inr": goal.current_goal_cost_inr,
+        "years_to_goal": int(goal.years_to_goal),
+        "current_goal_savings_inr": goal.current_goal_savings_inr,
+        "monthly_contribution_inr": goal.monthly_contribution_inr,
+        "annual_inflation_assumption": goal.annual_inflation_assumption,
+        "annual_return_assumption": goal.annual_return_assumption,
+        "plan": json.loads(goal.plan_json) if goal.plan_json else None,
+    }
+
+
+def recalculate_goal(goal: FinancialGoal) -> dict:
+    """Recalculate a goal using the existing planning function."""
+
+    request = GoalPlanRequest(
+        goal_name=goal.goal_name,
+        current_goal_cost_inr=goal.current_goal_cost_inr,
+        years_to_goal=int(goal.years_to_goal),
+        current_goal_savings_inr=goal.current_goal_savings_inr,
+        monthly_contribution_inr=goal.monthly_contribution_inr,
+        annual_inflation_assumption=goal.annual_inflation_assumption,
+        annual_return_assumption=goal.annual_return_assumption,
+    )
+
+    plan = build_goal_plan(request)
+
+    # Store a JSON-safe version of the plan.
+    return plan.model_dump(mode="json")
+
+
+@router.post(
+    "",
+    status_code=status.HTTP_201_CREATED,
+)
+def create_goal(
+    client_id: str,
+    request: FinancialGoalCreate,
+    db: Session = Depends(get_db),
+):
+    """Create a financial goal for an existing client."""
+
+    get_client_or_404(db, client_id)
+
+    goal = FinancialGoal(
+        client_id=client_id,
+        goal_name=request.goal_name,
+        current_goal_cost_inr=request.current_goal_cost_inr,
+        years_to_goal=request.years_to_goal,
+        current_goal_savings_inr=request.current_goal_savings_inr,
+        monthly_contribution_inr=request.monthly_contribution_inr,
+        annual_inflation_assumption=request.annual_inflation_assumption,
+        annual_return_assumption=request.annual_return_assumption,
+    )
+
+    try:
+        db.add(goal)
+        db.flush()
+
+        goal.plan_json = json.dumps(recalculate_goal(goal))
+
+        db.commit()
+        db.refresh(goal)
+
+    except Exception:
+        db.rollback()
+        raise
+
+    return serialize_goal(goal)
+
+
+@router.get("")
+def list_goals(
+    client_id: str,
+    db: Session = Depends(get_db),
+):
+    """List financial goals belonging to a client."""
+
+    get_client_or_404(db, client_id)
+
+    goals = (
+        db.query(FinancialGoal)
+        .filter(FinancialGoal.client_id == client_id)
+        .order_by(FinancialGoal.created_at.desc())
+        .all()
+    )
+
+    return {
+        "client_id": client_id,
+        "count": len(goals),
+        "goals": [serialize_goal(goal) for goal in goals],
+    }
+
+
+@router.get("/{goal_id}")
+def get_goal(
+    client_id: str,
+    goal_id: str,
+    db: Session = Depends(get_db),
+):
+    """Retrieve one goal belonging to a client."""
+
+    goal = db.get(FinancialGoal, goal_id)
+
+    if goal is None or goal.client_id != client_id:
+        raise HTTPException(
+            status_code=404,
+            detail="Financial goal not found for this client.",
+        )
+
+    return serialize_goal(goal)
+
+
+@router.patch("/{goal_id}")
+def update_goal(
+    client_id: str,
+    goal_id: str,
+    request: FinancialGoalUpdate,
+    db: Session = Depends(get_db),
+):
+    """Update a goal and recalculate its plan."""
+
+    goal = db.get(FinancialGoal, goal_id)
+
+    if goal is None or goal.client_id != client_id:
+        raise HTTPException(
+            status_code=404,
+            detail="Financial goal not found for this client.",
+        )
+
+    changes = request.model_dump(exclude_unset=True)
+
+    for field, value in changes.items():
+        setattr(goal, field, value)
+
+    try:
+        db.flush()
+        goal.plan_json = json.dumps(recalculate_goal(goal))
+
+        db.commit()
+        db.refresh(goal)
+
+    except Exception:
+        db.rollback()
+        raise
+
+    return serialize_goal(goal)
+
+
+@router.delete(
+    "/{goal_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def delete_goal(
+    client_id: str,
+    goal_id: str,
+    db: Session = Depends(get_db),
+):
+    """Delete a financial goal belonging to a client."""
+
+    goal = db.get(FinancialGoal, goal_id)
+
+    if goal is None or goal.client_id != client_id:
+        raise HTTPException(
+            status_code=404,
+            detail="Financial goal not found for this client.",
+        )
+
+    db.delete(goal)
+    db.commit()
+
+
+========== app\advisory_service.py ==========
+import json
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
+
+from app.database import get_db
+from app.models import Client, FinancialGoal
+from app.schemas import (
+    ClientProfile,
+    RecommendationDraft,
+    SuitabilityRequest,
+)
+from app.risk import assess_risk
+from app.guardrails import check_suitability
+from app.workflow import store
+from app.rag.api import fund_retriever
+
+
+router = APIRouter(
+    prefix="/clients/{client_id}/advisory-workflow",
+    tags=["End-to-End Advisory Workflow"],
+)
+
+
+class AdvisoryWorkflowRequest(BaseModel):
+    # Client financial information
+    age: int = Field(ge=18, le=110)
+    monthly_income_inr: float = Field(ge=0)
+    income_stability: int = Field(ge=1, le=5)
+    monthly_essential_expenses_inr: float = Field(ge=0)
+    monthly_debt_payments_inr: float = Field(ge=0)
+    liquid_savings_inr: float = Field(ge=0)
+    dependants: int = Field(ge=0, le=30)
+    goal_horizon_years: int = Field(ge=1, le=60)
+    risk_tolerance_score: int = Field(ge=0, le=100)
+    investment_experience_years: int = Field(ge=0, le=80)
+    recent_high_risk_losses: bool = False
+    notes: str | None = None
+
+    # Research and suitability inputs
+    research_question: str = Field(
+        min_length=3,
+        max_length=500,
+    )
+    requested_product_category: str = Field(
+        min_length=1,
+        max_length=120,
+    )
+    requested_outcome: str = Field(
+        default="",
+        max_length=1000,
+    )
+    proposed_equity_allocation_pct: float | None = Field(
+        default=None,
+        ge=0,
+        le=100,
+    )
+    proposed_small_cap_allocation_pct: float | None = Field(
+        default=None,
+        ge=0,
+        le=100,
+    )
+    asks_for_guaranteed_returns: bool = False
+    asks_for_extreme_fast_returns: bool = False
+    top_k: int = Field(default=3, ge=1, le=10)
+
+
+@router.post("")
+def run_advisory_workflow(
+    client_id: str,
+    request: AdvisoryWorkflowRequest,
+    db: Session = Depends(get_db),
+):
+    # 1. Retrieve the saved client.
+    client = db.get(Client, client_id)
+
+    if client is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Client not found.",
+        )
+
+    # 2. Build the client profile and assess risk.
+    profile = ClientProfile(
+        client_id=client_id,
+        age=request.age,
+        monthly_income_inr=request.monthly_income_inr,
+        income_stability=request.income_stability,
+        monthly_essential_expenses_inr=(
+            request.monthly_essential_expenses_inr
+        ),
+        monthly_debt_payments_inr=request.monthly_debt_payments_inr,
+        liquid_savings_inr=request.liquid_savings_inr,
+        dependants=request.dependants,
+        goal_horizon_years=request.goal_horizon_years,
+        risk_tolerance_score=request.risk_tolerance_score,
+        investment_experience_years=(
+            request.investment_experience_years
+        ),
+        recent_high_risk_losses=request.recent_high_risk_losses,
+        notes=request.notes,
+    )
+
+    risk_assessment = assess_risk(profile)
+
+    # Save the assessed risk band to the client record.
+    risk_band = getattr(
+        risk_assessment.recommended_ceiling_band,
+        "value",
+        risk_assessment.recommended_ceiling_band,
+    )
+
+    client.risk_profile = str(risk_band)
+    db.commit()
+
+    # 3. Retrieve the client's saved financial goals.
+    goals = (
+        db.query(FinancialGoal)
+        .filter(FinancialGoal.client_id == client_id)
+        .order_by(FinancialGoal.created_at.desc())
+        .all()
+    )
+
+    goal_summaries = []
+
+    for goal in goals:
+        plan = (
+            json.loads(goal.plan_json)
+            if goal.plan_json
+            else {}
+        )
+
+        goal_summaries.append(
+            {
+                "goal_id": goal.id,
+                "goal_name": goal.goal_name,
+                "years_to_goal": int(goal.years_to_goal),
+                "target_cost_today_inr": (
+                    goal.current_goal_cost_inr
+                ),
+                "required_monthly_sip_inr": plan.get(
+                    "required_monthly_sip_inr"
+                ),
+                "projected_shortfall_inr": plan.get(
+                    "projected_shortfall_inr"
+                ),
+            }
+        )
+
+    # 4. Retrieve supporting evidence from fund documents.
+    if fund_retriever.embeddings is None:
+        research_results = []
+        insufficient_evidence = True
+
+        research_message = (
+            "Fund documents are not indexed. "
+            "Fund-specific claims cannot be supported."
+        )
+    else:
+        retrieved = fund_retriever.search(
+            query=request.research_question,
+            top_k=request.top_k,
+        )
+
+        research_results = [
+            {
+                "source": item["source"],
+                "page": item["page"],
+                "text": item["text"],
+                "similarity": item["similarity"],
+            }
+            for item in retrieved
+        ]
+
+        insufficient_evidence = not bool(research_results)
+
+        research_message = (
+            "Retrieved passages require adviser verification."
+            if research_results
+            else "No relevant passages were found."
+        )
+
+    # 5. Run suitability checks.
+    suitability_request = SuitabilityRequest(
+        client=profile,
+        requested_product_category=(
+            request.requested_product_category
+        ),
+        requested_outcome=request.requested_outcome,
+        proposed_equity_allocation_pct=(
+            request.proposed_equity_allocation_pct
+        ),
+        proposed_small_cap_allocation_pct=(
+            request.proposed_small_cap_allocation_pct
+        ),
+        asks_for_guaranteed_returns=(
+            request.asks_for_guaranteed_returns
+        ),
+        asks_for_extreme_fast_returns=(
+            request.asks_for_extreme_fast_returns
+        ),
+    )
+
+    guardrail = check_suitability(suitability_request)
+
+    # 6. Prepare an adviser-facing draft.
+    supporting_facts = [
+        (
+            "Risk capacity score: "
+            f"{risk_assessment.capacity_score}/100."
+        ),
+        (
+            "Risk tolerance score: "
+            f"{risk_assessment.tolerance_score}/100."
+        ),
+        f"Risk ceiling: {risk_band}.",
+        f"Saved financial goals found: {len(goal_summaries)}.",
+    ]
+
+    for goal in goal_summaries:
+        supporting_facts.append(
+            f"Goal: {goal['goal_name']}; "
+            f"horizon: {goal['years_to_goal']} years; "
+            f"required monthly SIP estimate: "
+            f"{goal['required_monthly_sip_inr']} INR."
+        )
+
+    if insufficient_evidence:
+        supporting_facts.append(
+            "Insufficient fund-document evidence was retrieved. "
+            "Fund details and performance must not be inferred."
+        )
+
+    summary = (
+        "Adviser review draft generated using the submitted client "
+        "financial profile, risk assessment, saved financial goals, "
+        "suitability checks, and available fund research. "
+        "This is not a final investment recommendation. "
+        "The adviser must verify the client information, source "
+        "passages, product disclosures, and suitability before "
+        "making any recommendation."
+    )
+
+    draft = RecommendationDraft(
+        client_id=client_id,
+        summary=summary,
+        supporting_facts=supporting_facts,
+        source_citations=[
+            {
+                "source": item["source"],
+                "page": item["page"],
+                "similarity": item["similarity"],
+                "excerpt": item["text"],
+            }
+            for item in research_results
+        ],
+        guardrail=guardrail,
+        status="draft",
+    )
+
+    draft_result = store.create_draft(draft)
+
+    # 7. Return the complete workflow result.
+    return {
+        "client": {
+            "id": client.id,
+            "full_name": client.full_name,
+            "risk_profile": client.risk_profile,
+        },
+        "risk_assessment": risk_assessment.model_dump(
+            mode="json"
+        ),
+        "financial_goals": goal_summaries,
+        "fund_research": {
+            "question": request.research_question,
+            "results": research_results,
+            "insufficient_evidence": insufficient_evidence,
+            "message": research_message,
+        },
+        "suitability": guardrail.model_dump(
+            mode="json"
+        ),
+        "recommendation_draft": {
+            **draft_result,
+            "summary": draft.summary,
+            "supporting_facts": draft.supporting_facts,
+            "source_citations": draft.source_citations,
+            "guardrail": guardrail.model_dump(
+                mode="json"
+            ),
+        },
+        "next_action": (
+            "Verify the retrieved evidence and resolve suitability "
+            "concerns before submitting the draft for adviser review."
+        ),
+        "client_delivery_permitted": False,
+    }
+
+
+========== app\rag\api.py ==========
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
+
+from app.rag.retriever import FundRetriever
+
+router = APIRouter(prefix="/research", tags=["Fund Research"])
+
+# Shared retriever instance
+fund_retriever = FundRetriever()
+
+
+class ResearchRequest(BaseModel):
+    question: str = Field(
+        ...,
+        min_length=3,
+        max_length=500,
+        description="Question about indexed mutual fund documents"
+    )
+    top_k: int = Field(default=3, ge=1, le=10)
+
+
+@router.get("/status")
+def research_status():
+    """Check whether fund documents have been indexed."""
+
+    indexed = fund_retriever.embeddings is not None
+
+    return {
+        "indexed": indexed,
+        "chunks": len(fund_retriever.chunks),
+        "message": (
+            "Fund documents are ready."
+            if indexed
+            else "No fund documents have been indexed."
+        )
+    }
+
+
+@router.post("/search")
+def search_fund_documents(request: ResearchRequest):
+    """Retrieve relevant passages with source and page citations."""
+
+    if fund_retriever.embeddings is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Fund documents are not indexed yet."
+        )
+
+    results = fund_retriever.search(
+        query=request.question,
+        top_k=request.top_k
+    )
+
+    if not results:
+        return {
+            "question": request.question,
+            "results": [],
+            "insufficient_evidence": True,
+            "message": (
+                "No relevant passages were found in the indexed "
+                "documents. Missing financial facts must not be inferred."
+            )
+        }
+
+    return {
+        "question": request.question,
+        "results": [
+            {
+                "source": item["source"],
+                "page": item["page"],
+                "text": item["text"],
+                "similarity": item["similarity"]
+            }
+            for item in results
+        ],
+        "insufficient_evidence": False,
+        "message": (
+            "Retrieved passages require verification before "
+            "being relied upon for financial decisions."
+        )
+    }
+
+
+========== app\schemas.py ==========
+from __future__ import annotations
+
+from enum import Enum
+from typing import Literal
+
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    model_validator,
+)
+
+
+# ==================================================
+# RISK ENUMS
+# ==================================================
+
+class RiskBand(str, Enum):
+    VERY_LOW = "very_low"
+    LOW = "low"
+    MODERATE = "moderate"
+    HIGH = "high"
+    VERY_HIGH = "very_high"
+
+
+# ==================================================
+# CLIENT PROFILE
+# ==================================================
+
+class ClientProfile(BaseModel):
+    """
+    Financial and behavioural information used
+    by the risk assessment prototype.
+    """
+
+    model_config = ConfigDict(
+        use_enum_values=True,
+        extra="forbid",
+        str_strip_whitespace=True,
+    )
+
+    client_id: str = Field(
+        min_length=1,
+        max_length=100,
+    )
+
+    age: int = Field(
+        ge=18,
+        le=110,
+    )
+
+    monthly_income_inr: float = Field(
+        ge=0,
+        description="Monthly income in Indian rupees.",
+    )
+
+    income_stability: int = Field(
+        ge=1,
+        le=5,
+        description="1 = very unstable; 5 = very stable.",
+    )
+
+    monthly_essential_expenses_inr: float = Field(
+        ge=0,
+    )
+
+    monthly_debt_payments_inr: float = Field(
+        ge=0,
+    )
+
+    liquid_savings_inr: float = Field(
+        ge=0,
+    )
+
+    dependants: int = Field(
+        ge=0,
+        le=30,
+    )
+
+    goal_horizon_years: int = Field(
+        ge=1,
+        le=60,
+    )
+
+    risk_tolerance_score: int = Field(
+        ge=0,
+        le=100,
+        description="Behavioural questionnaire score.",
+    )
+
+    investment_experience_years: int = Field(
+        ge=0,
+        le=80,
+    )
+
+    recent_high_risk_losses: bool = False
+
+    notes: str | None = Field(
+        default=None,
+        max_length=2000,
+    )
+
+
+# ==================================================
+# RISK ASSESSMENT RESULT
+# ==================================================
+
+class RiskAssessment(BaseModel):
+    model_config = ConfigDict(
+        use_enum_values=True,
+        extra="forbid",
+    )
+
+    capacity_score: int = Field(
+        ge=0,
+        le=100,
+    )
+
+    tolerance_score: int = Field(
+        ge=0,
+        le=100,
+    )
+
+    capacity_band: RiskBand
+
+    tolerance_band: RiskBand
+
+    recommended_ceiling_band: RiskBand
+
+    conflict_detected: bool
+
+    resolution_rule: str
+
+    rationale: list[str] = Field(
+        min_length=1,
+    )
+
+
+# ==================================================
+# GOAL PLANNING
+# ==================================================
+
+class GoalPlanRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    goal_name: str = Field(
+        min_length=1,
+        max_length=120,
+    )
+
+    current_goal_cost_inr: float = Field(
+        gt=0,
+        description="Goal cost in today's rupees.",
+    )
+
+    years_to_goal: int = Field(
+        ge=1,
+        le=60,
+    )
+
+    current_goal_savings_inr: float = Field(
+        ge=0,
+    )
+
+    monthly_contribution_inr: float | None = Field(
+        default=None,
+        ge=0,
+    )
+
+    annual_inflation_assumption: float = Field(
+        default=0.06,
+        ge=0,
+        le=0.20,
+    )
+
+    annual_return_assumption: float = Field(
+        default=0.08,
+        ge=0,
+        le=0.30,
+    )
+
+
+class GoalPlan(BaseModel):
+    goal_name: str
+
+    years_to_goal: int
+
+    inflation_assumption: float
+
+    return_assumption: float
+
+    inflation_adjusted_target_inr: float
+
+    current_savings_future_value_inr: float
+
+    required_monthly_sip_inr: float
+
+    proposed_monthly_contribution_inr: float | None
+
+    projected_corpus_inr: float | None
+
+    projected_shortfall_inr: float | None
+
+    assumptions_and_disclosures: list[str] = Field(
+        default_factory=list,
+    )
+
+
+# ==================================================
+# SUITABILITY CHECK
+# ==================================================
+
+class SuitabilityRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    client: ClientProfile
+
+    requested_product_category: str = Field(
+        min_length=1,
+        max_length=120,
+    )
+
+    requested_outcome: str = Field(
+        default="",
+        max_length=1000,
+    )
+
+    proposed_equity_allocation_pct: float | None = Field(
+        default=None,
+        ge=0,
+        le=100,
+    )
+
+    proposed_small_cap_allocation_pct: float | None = Field(
+        default=None,
+        ge=0,
+        le=100,
+    )
+
+    asks_for_guaranteed_returns: bool = False
+
+    asks_for_extreme_fast_returns: bool = False
+
+    @model_validator(mode="after")
+    def validate_allocation(self) -> SuitabilityRequest:
+        if (
+            self.proposed_equity_allocation_pct is not None
+            and self.proposed_small_cap_allocation_pct is not None
+            and self.proposed_small_cap_allocation_pct
+            > self.proposed_equity_allocation_pct
+        ):
+            raise ValueError(
+                "Small-cap allocation cannot exceed total "
+                "proposed equity allocation."
+            )
+
+        return self
+
+
+class GuardrailResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal[
+        "allow_for_adviser_review",
+        "needs_more_information",
+        "blocked_pending_reassessment",
+    ]
+
+    flags: list[str] = Field(
+        default_factory=list,
+    )
+
+    explanation: list[str] = Field(
+        default_factory=list,
+    )
+
+    adviser_approval_required: bool = True
+
+    client_delivery_permitted: bool = False
+
+
+# ==================================================
+# RECOMMENDATION DRAFT
+# ==================================================
+
+class RecommendationDraft(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    client_id: str = Field(
+        min_length=1,
+        max_length=100,
+    )
+
+    summary: str = Field(
+        min_length=1,
+        max_length=3000,
+    )
+
+    supporting_facts: list[str] = Field(
+        default_factory=list,
+    )
+
+    source_citations: list[dict] = Field(
+        default_factory=list,
+    )
+
+    guardrail: GuardrailResult
+
+    status: Literal[
+        "draft",
+        "submitted_for_review",
+        "approved",
+        "rejected",
+    ] = "draft"
+
+
+# ==================================================
+# ADVISER APPROVAL
+# ==================================================
+
+class ApprovalAction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    adviser_id: str = Field(
+        min_length=1,
+        max_length=100,
+    )
+
+    decision: Literal[
+        "approve",
+        "reject",
+    ]
+
+    reason: str = Field(
+        min_length=3,
+        max_length=1000,
+    )
+
+
+========== app\workflow.py ==========
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from uuid import uuid4
+from .schemas import RecommendationDraft, ApprovalAction
+
+
+@dataclass
+class ApprovalStore:
+    """In-memory demo workflow. Replace with persistent DB before production."""
+    drafts: dict[str, RecommendationDraft] = field(default_factory=dict)
+    audit_log: list[dict] = field(default_factory=list)
+
+    def create_draft(self, draft: RecommendationDraft) -> dict:
+        draft_id = str(uuid4())
+        draft.status = "draft"
+        self.drafts[draft_id] = draft
+        self.audit_log.append(self._event(draft_id, "draft_created", "system", "Generated draft; not client deliverable."))
+        return {"draft_id": draft_id, "status": draft.status, "client_delivery_permitted": False}
+
+    def submit_for_review(self, draft_id: str) -> dict:
+        draft = self._get(draft_id)
+        if draft.status != "draft":
+            raise ValueError("Only a draft can be submitted for review.")
+        draft.status = "submitted_for_review"
+        self.audit_log.append(self._event(draft_id, "submitted_for_review", "system", "Sent to adviser review queue."))
+        return {"draft_id": draft_id, "status": draft.status, "client_delivery_permitted": False}
+
+    def decide(self, draft_id: str, action: ApprovalAction) -> dict:
+        draft = self._get(draft_id)
+        if draft.status != "submitted_for_review":
+            raise ValueError("Only submitted drafts can be approved or rejected.")
+        draft.status = "approved" if action.decision == "approve" else "rejected"
+        self.audit_log.append(self._event(draft_id, action.decision, action.adviser_id, action.reason))
+        # Even approved content should only be delivered by a separately authorized delivery service.
+        return {
+            "draft_id": draft_id,
+            "status": draft.status,
+            "client_delivery_permitted": False,
+            "note": "Approval recorded. Client delivery must be handled by a separate authorized service."
+        }
+
+    def _get(self, draft_id: str) -> RecommendationDraft:
+        if draft_id not in self.drafts:
+            raise KeyError("Draft not found.")
+        return self.drafts[draft_id]
+
+    @staticmethod
+    def _event(draft_id: str, event: str, actor: str, reason: str) -> dict:
+        return {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "draft_id": draft_id,
+            "event": event,
+            "actor": actor,
+            "reason": reason,
+        }
+
+
+store = ApprovalStore()
+
+
+========== app\guardrails.py ==========
+from .schemas import SuitabilityRequest, GuardrailResult
+from .risk import assess_risk, BAND_ORDER
+from .schemas import RiskBand
+
+
+def check_suitability(req: SuitabilityRequest) -> GuardrailResult:
+    flags: list[str] = []
+    explanation: list[str] = []
+    profile = req.client
+    assessment = assess_risk(profile)
+
+    if req.asks_for_guaranteed_returns or "guarantee" in req.requested_outcome.lower():
+        flags.append("GUARANTEED_RETURN_REQUEST")
+        explanation.append("Investment returns cannot be guaranteed. Replace the claim with scenario analysis and explicit risk disclosures.")
+
+    if req.asks_for_extreme_fast_returns or any(
+        phrase in req.requested_outcome.lower()
+        for phrase in ["20% guaranteed", "high returns fast", "double my money quickly", "risk-free high return"]
+    ):
+        flags.append("UNREALISTIC_RETURN_EXPECTATION")
+        explanation.append("The requested outcome may imply unrealistic or misleading return expectations; adviser discussion is required.")
+
+    if profile.age >= 65 and (req.proposed_small_cap_allocation_pct or 0) >= 80:
+        flags.append("AGE_AND_CONCENTRATION_REVIEW")
+        explanation.append("Small-cap-only or highly concentrated exposure may be inconsistent with liquidity needs and loss-bearing capacity; require a full suitability review.")
+
+    if req.proposed_equity_allocation_pct is not None:
+        if assessment.recommended_ceiling_band in (RiskBand.VERY_LOW, RiskBand.LOW) and req.proposed_equity_allocation_pct > 40:
+            flags.append("ALLOCATION_EXCEEDS_PROFILE")
+            explanation.append("Proposed equity allocation appears high relative to the conservative prototype risk-profile ceiling; adviser must reassess goals and capacity.")
+        if assessment.recommended_ceiling_band == RiskBand.VERY_LOW and req.proposed_equity_allocation_pct > 20:
+            flags.append("LOW_CAPACITY_HIGH_EQUITY")
+            explanation.append("A very-low risk profile requires additional review before material equity exposure.")
+
+    if profile.recent_high_risk_losses and req.requested_product_category.lower() in {"small_cap", "sectoral", "thematic", "derivatives", "f&o"}:
+        flags.append("RECENT_LOSSES_HIGH_RISK_REQUEST")
+        explanation.append("Recent high-risk losses plus a request for a high-risk product triggers a pause, review of objectives, and risk understanding.")
+
+    if profile.monthly_income_inr <= profile.monthly_essential_expenses_inr + profile.monthly_debt_payments_inr:
+        flags.append("NO_MONTHLY_SURPLUS")
+        explanation.append("Declared income does not exceed essential expenses plus debt payments; confirm emergency liquidity before committing to a recurring investment.")
+
+    if assessment.conflict_detected:
+        flags.append("CAPACITY_TOLERANCE_CONFLICT")
+        explanation.append("Risk capacity and behavioural tolerance differ; use the conservative ceiling and require adviser review.")
+
+    if not flags:
+        explanation.append("No hard-coded trigger fired. This does not establish suitability; adviser must review the complete client profile and product disclosures.")
+
+    if any(f in flags for f in ["GUARANTEED_RETURN_REQUEST", "UNREALISTIC_RETURN_EXPECTATION", "AGE_AND_CONCENTRATION_REVIEW", "RECENT_LOSSES_HIGH_RISK_REQUEST"]):
+        status = "blocked_pending_reassessment"
+    elif any(f in flags for f in ["ALLOCATION_EXCEEDS_PROFILE", "LOW_CAPACITY_HIGH_EQUITY", "NO_MONTHLY_SURPLUS", "CAPACITY_TOLERANCE_CONFLICT"]):
+        status = "needs_more_information"
+    else:
+        status = "allow_for_adviser_review"
+
+    return GuardrailResult(
+        status=status,
+        flags=flags,
+        explanation=explanation,
+        adviser_approval_required=True,
+        client_delivery_permitted=False,
+    )
+
+
+========== app\models.py ==========
+import uuid
+from datetime import datetime, timezone
+
+from sqlalchemy import (
+    Column,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+)
+from sqlalchemy.orm import relationship
+
+from app.database import Base
+
+
+def generate_uuid():
+    return str(uuid.uuid4())
+
+
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+class Client(Base):
+    __tablename__ = "clients"
+
+    id = Column(
+        String(36),
+        primary_key=True,
+        default=generate_uuid,
+    )
+
+    full_name = Column(String(100), nullable=False, index=True)
+    email = Column(String(255), nullable=True, unique=True, index=True)
+    phone = Column(String(20), nullable=True)
+
+    age = Column(Float, nullable=True)
+    occupation = Column(String(100), nullable=True)
+
+    annual_income = Column(Float, nullable=True)
+    monthly_expenses = Column(Float, nullable=True)
+    existing_investments = Column(Float, nullable=True)
+    emergency_fund = Column(Float, nullable=True)
+
+    risk_profile = Column(String(30), nullable=True)
+    financial_notes = Column(Text, nullable=True)
+
+    created_at = Column(
+        DateTime(timezone=True),
+        default=utc_now,
+        nullable=False,
+    )
+
+    updated_at = Column(
+        DateTime(timezone=True),
+        default=utc_now,
+        onupdate=utc_now,
+        nullable=False,
+    )
+
+    # A client can have multiple financial goals.
+    goals = relationship(
+        "FinancialGoal",
+        back_populates="client",
+        cascade="all, delete-orphan",
+    )
+
+
+class FinancialGoal(Base):
+    __tablename__ = "financial_goals"
+
+    id = Column(
+        String(36),
+        primary_key=True,
+        default=generate_uuid,
+    )
+
+    client_id = Column(
+        String(36),
+        ForeignKey("clients.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    goal_name = Column(String(120), nullable=False)
+
+    current_goal_cost_inr = Column(
+        Float,
+        nullable=False,
+    )
+
+    years_to_goal = Column(
+    Integer,
+    nullable=False,
+)
+
+    current_goal_savings_inr = Column(
+        Float,
+        nullable=False,
+        default=0,
+    )
+
+    monthly_contribution_inr = Column(
+        Float,
+        nullable=True,
+    )
+
+    annual_inflation_assumption = Column(
+        Float,
+        nullable=False,
+        default=0.06,
+    )
+
+    annual_return_assumption = Column(
+        Float,
+        nullable=False,
+        default=0.08,
+    )
+
+    # Store the latest calculated plan as JSON text.
+    plan_json = Column(
+        Text,
+        nullable=True,
+    )
+
+    created_at = Column(
+        DateTime(timezone=True),
+        default=utc_now,
+        nullable=False,
+    )
+
+    updated_at = Column(
+        DateTime(timezone=True),
+        default=utc_now,
+        onupdate=utc_now,
+        nullable=False,
+    )
+
+    client = relationship(
+        "Client",
+        back_populates="goals",
+    )
+
+
+========== app\database.py ==========
+from pathlib import Path
+
+from sqlalchemy import create_engine
+from sqlalchemy.orm import declarative_base, sessionmaker
+
+# Project root directory
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+# Store the database in the project root
+DATABASE_URL = f"sqlite:///{(BASE_DIR / 'finpilot.db').as_posix()}"
+
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={"check_same_thread": False},
+)
+
+SessionLocal = sessionmaker(
+    autocommit=False,
+    autoflush=False,
+    bind=engine,
+)
+
+Base = declarative_base()
+
+
+def get_db():
+    """Provide a database session for a FastAPI request."""
+    db = SessionLocal()
+
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+========== requirements.txt ==========
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+pydantic>=2.8,<3.0
+pytest>=8.0,<9.0
+httpx>=0.27,<1.0
+
+
+========== app\main.py ==========
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException
+
+from app.schemas import (
+    ClientProfile,
+    GoalPlanRequest,
+    SuitabilityRequest,
+    RecommendationDraft,
+    ApprovalAction,
+)
+
+from app.risk import assess_risk
+from app.goals import build_goal_plan, glide_path
+from app.guardrails import check_suitability
+from app.workflow import store
+
+# Database imports
+from app.database import Base, engine
+from app import models
+
+# Client and financial goal management
+from app.client_service import router as clients_router
+from app.goal_service import router as goal_management_router
+
+# RAG imports
+from app.rag.api import (
+    router as research_router,
+    fund_retriever,
+)
+from app.rag.document_loader import load_pdf
+from app.advisory_service import router as advisory_workflow_router
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Load and index the mutual fund factsheet at startup."""
+
+    project_root = Path(__file__).resolve().parent.parent
+
+    pdf_path = (
+        project_root
+        / "data"
+        / "fund_documents"
+        / "HDFC_MF_Factsheet.pdf"
+    )
+
+    if not pdf_path.exists():
+        print(
+            "FinPilot AI: factsheet not found at "
+            f"{pdf_path.resolve()}"
+        )
+    else:
+        try:
+            pages = load_pdf(str(pdf_path))
+            chunk_count = fund_retriever.index_pages(pages)
+
+            print(
+                "FinPilot AI: indexed "
+                f"{chunk_count} fund-document chunks."
+            )
+
+        except Exception as exc:
+            print(
+                "FinPilot AI: document indexing failed: "
+                f"{exc}"
+            )
+
+    yield
+
+
+app = FastAPI(
+    title="FinPilot AI Core",
+    version="0.4.0",
+    description=(
+        "Adviser-controlled investment planning with "
+        "evidence-grounded mutual fund research, "
+        "persistent client management, and financial goal tracking."
+    ),
+    lifespan=lifespan,
+)
+
+
+# --------------------------------------------------
+# DATABASE INITIALIZATION
+# --------------------------------------------------
+
+# Register SQLAlchemy models and create missing tables.
+Base.metadata.create_all(bind=engine)
+
+
+# --------------------------------------------------
+# REGISTER ROUTERS
+# --------------------------------------------------
+
+app.include_router(research_router)
+app.include_router(clients_router)
+app.include_router(goal_management_router)
+app.include_router(advisory_workflow_router)
+
+# --------------------------------------------------
+# HEALTH CHECK
+# --------------------------------------------------
+
+@app.get("/health", tags=["System"])
+def health():
+    """Check whether the backend is running."""
+
+    return {
+        "status": "ok",
+        "service": "finpilot-core",
+        "version": "0.4.0",
+    }
+
+
+# --------------------------------------------------
+# RISK ASSESSMENT
+# --------------------------------------------------
+
+@app.post("/risk/assess", tags=["Risk Assessment"])
+def risk_assess(profile: ClientProfile):
+    """Assess a client's investment risk profile."""
+
+    return assess_risk(profile)
+
+
+# --------------------------------------------------
+# FINANCIAL GOAL PLANNING
+# --------------------------------------------------
+
+@app.post("/goals/plan", tags=["Financial Goals"])
+def goals_plan(request: GoalPlanRequest):
+    """Calculate a financial goal plan without saving it."""
+
+    return build_goal_plan(request)
+
+
+@app.get("/goals/glide-path", tags=["Financial Goals"])
+def goals_glide_path(
+    start_equity_pct: float = 60,
+    years_to_goal: int = 10,
+):
+    """Generate an illustrative equity allocation glide path."""
+
+    if not 0 <= start_equity_pct <= 100:
+        raise HTTPException(
+            status_code=400,
+            detail="start_equity_pct must be between 0 and 100",
+        )
+
+    if not 1 <= years_to_goal <= 60:
+        raise HTTPException(
+            status_code=400,
+            detail="years_to_goal must be between 1 and 60",
+        )
+
+    return {
+        "glide_path": glide_path(
+            start_equity_pct,
+            years_to_goal,
+        )
+    }
+
+
+# --------------------------------------------------
+# INVESTMENT SUITABILITY
+# --------------------------------------------------
+
+@app.post("/suitability/check", tags=["Suitability"])
+def suitability_check(request: SuitabilityRequest):
+    """Check a proposed investment against suitability rules."""
+
+    return check_suitability(request)
+
+
+# --------------------------------------------------
+# ADVISER RECOMMENDATION WORKFLOW
+# --------------------------------------------------
+
+@app.post("/adviser/drafts", tags=["Adviser Workflow"])
+def create_draft(draft: RecommendationDraft):
+    """Create a recommendation draft."""
+
+    return store.create_draft(draft)
+
+
+@app.post(
+    "/adviser/drafts/{draft_id}/submit",
+    tags=["Adviser Workflow"],
+)
+def submit_draft(draft_id: str):
+    """Submit a recommendation draft for adviser review."""
+
+    try:
+        return store.submit_for_review(draft_id)
+
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        )
+
+
+@app.post(
+    "/adviser/drafts/{draft_id}/decision",
+    tags=["Adviser Workflow"],
+)
+def decide_draft(
+    draft_id: str,
+    action: ApprovalAction,
+):
+    """Record an adviser approval or rejection decision."""
+
+    try:
+        return store.decide(draft_id, action)
+
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        )
+
+
+@app.get("/adviser/audit-log", tags=["Adviser Workflow"])
+def audit_log():
+    """Retrieve adviser workflow audit events."""
+
+    return {
+        "events": store.audit_log,
+    }
+
+
+========== app\client_service.py ==========
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel, ConfigDict, Field, EmailStr
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from app.database import get_db
+from app.models import Client
+
+router = APIRouter(prefix="/clients", tags=["Client Management"])
+
+
+class ClientCreate(BaseModel):
+    full_name: str = Field(..., min_length=2, max_length=100)
+    email: EmailStr | None = None
+    phone: str | None = Field(default=None, max_length=20)
+
+    age: float | None = Field(default=None, gt=0, le=120)
+    occupation: str | None = Field(default=None, max_length=100)
+
+    annual_income: float | None = Field(default=None, ge=0)
+    monthly_expenses: float | None = Field(default=None, ge=0)
+    existing_investments: float | None = Field(default=None, ge=0)
+    emergency_fund: float | None = Field(default=None, ge=0)
+
+    financial_notes: str | None = None
+
+
+class ClientUpdate(BaseModel):
+    full_name: str | None = Field(default=None, min_length=2, max_length=100)
+    email: EmailStr | None = None
+    phone: str | None = Field(default=None, max_length=20)
+
+    age: float | None = Field(default=None, gt=0, le=120)
+    occupation: str | None = Field(default=None, max_length=100)
+
+    annual_income: float | None = Field(default=None, ge=0)
+    monthly_expenses: float | None = Field(default=None, ge=0)
+    existing_investments: float | None = Field(default=None, ge=0)
+    emergency_fund: float | None = Field(default=None, ge=0)
+
+    financial_notes: str | None = None
+
+
+class ClientResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    full_name: str
+    email: str | None
+    phone: str | None
+    age: float | None
+    occupation: str | None
+
+    annual_income: float | None
+    monthly_expenses: float | None
+    existing_investments: float | None
+    emergency_fund: float | None
+
+    risk_profile: str | None
+    financial_notes: str | None
+
+
+@router.post(
+    "",
+    response_model=ClientResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_client(
+    request: ClientCreate,
+    db: Session = Depends(get_db),
+):
+    client = Client(**request.model_dump())
+
+    db.add(client)
+
+    try:
+        db.commit()
+        db.refresh(client)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="A client with this email already exists.",
+        )
+
+    return client
+
+
+@router.get("", response_model=list[ClientResponse])
+def list_clients(db: Session = Depends(get_db)):
+    return db.query(Client).order_by(Client.full_name).all()
+
+
+@router.get("/{client_id}", response_model=ClientResponse)
+def get_client(
+    client_id: str,
+    db: Session = Depends(get_db),
+):
+    client = db.get(Client, client_id)
+
+    if client is None:
+        raise HTTPException(status_code=404, detail="Client not found.")
+
+    return client
+
+
+@router.patch("/{client_id}", response_model=ClientResponse)
+def update_client(
+    client_id: str,
+    request: ClientUpdate,
+    db: Session = Depends(get_db),
+):
+    client = db.get(Client, client_id)
+
+    if client is None:
+        raise HTTPException(status_code=404, detail="Client not found.")
+
+    changes = request.model_dump(exclude_unset=True)
+
+    for field, value in changes.items():
+        setattr(client, field, value)
+
+    try:
+        db.commit()
+        db.refresh(client)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="A client with this email already exists.",
+        )
+
+    return client
+
+
+@router.delete("/{client_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_client(
+    client_id: str,
+    db: Session = Depends(get_db),
+):
+    client = db.get(Client, client_id)
+
+    if client is None:
+        raise HTTPException(status_code=404, detail="Client not found.")
+
+    db.delete(client)
+    db.commit()
+
+
+========== app\goal_service.py ==========
+import json
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy.orm import Session
+
+from app.database import get_db
+from app.models import Client, FinancialGoal
+from app.goals import build_goal_plan
+from app.schemas import GoalPlan, GoalPlanRequest
+
+
+router = APIRouter(
+    prefix="/clients/{client_id}/goals",
+    tags=["Financial Goal Management"],
+)
+
+
+class FinancialGoalCreate(GoalPlanRequest):
+    """Request to create and calculate a persistent financial goal."""
+
+    pass
+
+
+class FinancialGoalUpdate(BaseModel):
+    """Fields that can be updated on an existing goal."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    goal_name: str | None = Field(default=None, min_length=1, max_length=120)
+    current_goal_cost_inr: float | None = Field(default=None, gt=0)
+    years_to_goal: int | None = Field(default=None, ge=1, le=60)
+    current_goal_savings_inr: float | None = Field(default=None, ge=0)
+    monthly_contribution_inr: float | None = Field(default=None, ge=0)
+    annual_inflation_assumption: float | None = Field(
+        default=None, ge=0, le=0.20
+    )
+    annual_return_assumption: float | None = Field(
+        default=None, ge=0, le=0.30
+    )
+
+
+class FinancialGoalResponse(BaseModel):
+    """A persisted goal and its latest calculated plan."""
+
+    id: str
+    client_id: str
+    goal_name: str
+    current_goal_cost_inr: float
+    years_to_goal: int
+    current_goal_savings_inr: float
+    monthly_contribution_inr: float | None
+    annual_inflation_assumption: float
+    annual_return_assumption: float
+    plan: dict[str, Any] | None
+
+
+def get_client_or_404(db: Session, client_id: str) -> Client:
+    client = db.get(Client, client_id)
+
+    if client is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Client not found.",
+        )
+
+    return client
+
+
+def serialize_goal(goal: FinancialGoal) -> dict:
+    """Convert a database goal to a JSON-compatible response."""
+
+    return {
+        "id": goal.id,
+        "client_id": goal.client_id,
+        "goal_name": goal.goal_name,
+        "current_goal_cost_inr": goal.current_goal_cost_inr,
+        "years_to_goal": int(goal.years_to_goal),
+        "current_goal_savings_inr": goal.current_goal_savings_inr,
+        "monthly_contribution_inr": goal.monthly_contribution_inr,
+        "annual_inflation_assumption": goal.annual_inflation_assumption,
+        "annual_return_assumption": goal.annual_return_assumption,
+        "plan": json.loads(goal.plan_json) if goal.plan_json else None,
+    }
+
+
+def recalculate_goal(goal: FinancialGoal) -> dict:
+    """Recalculate a goal using the existing planning function."""
+
+    request = GoalPlanRequest(
+        goal_name=goal.goal_name,
+        current_goal_cost_inr=goal.current_goal_cost_inr,
+        years_to_goal=int(goal.years_to_goal),
+        current_goal_savings_inr=goal.current_goal_savings_inr,
+        monthly_contribution_inr=goal.monthly_contribution_inr,
+        annual_inflation_assumption=goal.annual_inflation_assumption,
+        annual_return_assumption=goal.annual_return_assumption,
+    )
+
+    plan = build_goal_plan(request)
+
+    # Store a JSON-safe version of the plan.
+    return plan.model_dump(mode="json")
+
+
+@router.post(
+    "",
+    status_code=status.HTTP_201_CREATED,
+)
+def create_goal(
+    client_id: str,
+    request: FinancialGoalCreate,
+    db: Session = Depends(get_db),
+):
+    """Create a financial goal for an existing client."""
+
+    get_client_or_404(db, client_id)
+
+    goal = FinancialGoal(
+        client_id=client_id,
+        goal_name=request.goal_name,
+        current_goal_cost_inr=request.current_goal_cost_inr,
+        years_to_goal=request.years_to_goal,
+        current_goal_savings_inr=request.current_goal_savings_inr,
+        monthly_contribution_inr=request.monthly_contribution_inr,
+        annual_inflation_assumption=request.annual_inflation_assumption,
+        annual_return_assumption=request.annual_return_assumption,
+    )
+
+    try:
+        db.add(goal)
+        db.flush()
+
+        goal.plan_json = json.dumps(recalculate_goal(goal))
+
+        db.commit()
+        db.refresh(goal)
+
+    except Exception:
+        db.rollback()
+        raise
+
+    return serialize_goal(goal)
+
+
+@router.get("")
+def list_goals(
+    client_id: str,
+    db: Session = Depends(get_db),
+):
+    """List financial goals belonging to a client."""
+
+    get_client_or_404(db, client_id)
+
+    goals = (
+        db.query(FinancialGoal)
+        .filter(FinancialGoal.client_id == client_id)
+        .order_by(FinancialGoal.created_at.desc())
+        .all()
+    )
+
+    return {
+        "client_id": client_id,
+        "count": len(goals),
+        "goals": [serialize_goal(goal) for goal in goals],
+    }
+
+
+@router.get("/{goal_id}")
+def get_goal(
+    client_id: str,
+    goal_id: str,
+    db: Session = Depends(get_db),
+):
+    """Retrieve one goal belonging to a client."""
+
+    goal = db.get(FinancialGoal, goal_id)
+
+    if goal is None or goal.client_id != client_id:
+        raise HTTPException(
+            status_code=404,
+            detail="Financial goal not found for this client.",
+        )
+
+    return serialize_goal(goal)
+
+
+@router.patch("/{goal_id}")
+def update_goal(
+    client_id: str,
+    goal_id: str,
+    request: FinancialGoalUpdate,
+    db: Session = Depends(get_db),
+):
+    """Update a goal and recalculate its plan."""
+
+    goal = db.get(FinancialGoal, goal_id)
+
+    if goal is None or goal.client_id != client_id:
+        raise HTTPException(
+            status_code=404,
+            detail="Financial goal not found for this client.",
+        )
+
+    changes = request.model_dump(exclude_unset=True)
+
+    for field, value in changes.items():
+        setattr(goal, field, value)
+
+    try:
+        db.flush()
+        goal.plan_json = json.dumps(recalculate_goal(goal))
+
+        db.commit()
+        db.refresh(goal)
+
+    except Exception:
+        db.rollback()
+        raise
+
+    return serialize_goal(goal)
+
+
+@router.delete(
+    "/{goal_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def delete_goal(
+    client_id: str,
+    goal_id: str,
+    db: Session = Depends(get_db),
+):
+    """Delete a financial goal belonging to a client."""
+
+    goal = db.get(FinancialGoal, goal_id)
+
+    if goal is None or goal.client_id != client_id:
+        raise HTTPException(
+            status_code=404,
+            detail="Financial goal not found for this client.",
+        )
+
+    db.delete(goal)
+    db.commit()
+
+
+========== app\advisory_service.py ==========
+import json
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
+
+from app.database import get_db
+from app.models import Client, FinancialGoal
+from app.schemas import (
+    ClientProfile,
+    RecommendationDraft,
+    SuitabilityRequest,
+)
+from app.risk import assess_risk
+from app.guardrails import check_suitability
+from app.workflow import store
+from app.rag.api import fund_retriever
+
+
+router = APIRouter(
+    prefix="/clients/{client_id}/advisory-workflow",
+    tags=["End-to-End Advisory Workflow"],
+)
+
+
+class AdvisoryWorkflowRequest(BaseModel):
+    # Client financial information
+    age: int = Field(ge=18, le=110)
+    monthly_income_inr: float = Field(ge=0)
+    income_stability: int = Field(ge=1, le=5)
+    monthly_essential_expenses_inr: float = Field(ge=0)
+    monthly_debt_payments_inr: float = Field(ge=0)
+    liquid_savings_inr: float = Field(ge=0)
+    dependants: int = Field(ge=0, le=30)
+    goal_horizon_years: int = Field(ge=1, le=60)
+    risk_tolerance_score: int = Field(ge=0, le=100)
+    investment_experience_years: int = Field(ge=0, le=80)
+    recent_high_risk_losses: bool = False
+    notes: str | None = None
+
+    # Research and suitability inputs
+    research_question: str = Field(
+        min_length=3,
+        max_length=500,
+    )
+    requested_product_category: str = Field(
+        min_length=1,
+        max_length=120,
+    )
+    requested_outcome: str = Field(
+        default="",
+        max_length=1000,
+    )
+    proposed_equity_allocation_pct: float | None = Field(
+        default=None,
+        ge=0,
+        le=100,
+    )
+    proposed_small_cap_allocation_pct: float | None = Field(
+        default=None,
+        ge=0,
+        le=100,
+    )
+    asks_for_guaranteed_returns: bool = False
+    asks_for_extreme_fast_returns: bool = False
+    top_k: int = Field(default=3, ge=1, le=10)
+
+
+@router.post("")
+def run_advisory_workflow(
+    client_id: str,
+    request: AdvisoryWorkflowRequest,
+    db: Session = Depends(get_db),
+):
+    # 1. Retrieve the saved client.
+    client = db.get(Client, client_id)
+
+    if client is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Client not found.",
+        )
+
+    # 2. Build the client profile and assess risk.
+    profile = ClientProfile(
+        client_id=client_id,
+        age=request.age,
+        monthly_income_inr=request.monthly_income_inr,
+        income_stability=request.income_stability,
+        monthly_essential_expenses_inr=(
+            request.monthly_essential_expenses_inr
+        ),
+        monthly_debt_payments_inr=request.monthly_debt_payments_inr,
+        liquid_savings_inr=request.liquid_savings_inr,
+        dependants=request.dependants,
+        goal_horizon_years=request.goal_horizon_years,
+        risk_tolerance_score=request.risk_tolerance_score,
+        investment_experience_years=(
+            request.investment_experience_years
+        ),
+        recent_high_risk_losses=request.recent_high_risk_losses,
+        notes=request.notes,
+    )
+
+    risk_assessment = assess_risk(profile)
+
+    # Save the assessed risk band to the client record.
+    risk_band = getattr(
+        risk_assessment.recommended_ceiling_band,
+        "value",
+        risk_assessment.recommended_ceiling_band,
+    )
+
+    client.risk_profile = str(risk_band)
+    db.commit()
+
+    # 3. Retrieve the client's saved financial goals.
+    goals = (
+        db.query(FinancialGoal)
+        .filter(FinancialGoal.client_id == client_id)
+        .order_by(FinancialGoal.created_at.desc())
+        .all()
+    )
+
+    goal_summaries = []
+
+    for goal in goals:
+        plan = (
+            json.loads(goal.plan_json)
+            if goal.plan_json
+            else {}
+        )
+
+        goal_summaries.append(
+            {
+                "goal_id": goal.id,
+                "goal_name": goal.goal_name,
+                "years_to_goal": int(goal.years_to_goal),
+                "target_cost_today_inr": (
+                    goal.current_goal_cost_inr
+                ),
+                "required_monthly_sip_inr": plan.get(
+                    "required_monthly_sip_inr"
+                ),
+                "projected_shortfall_inr": plan.get(
+                    "projected_shortfall_inr"
+                ),
+            }
+        )
+
+    # 4. Retrieve supporting evidence from fund documents.
+    if fund_retriever.embeddings is None:
+        research_results = []
+        insufficient_evidence = True
+
+        research_message = (
+            "Fund documents are not indexed. "
+            "Fund-specific claims cannot be supported."
+        )
+    else:
+        retrieved = fund_retriever.search(
+            query=request.research_question,
+            top_k=request.top_k,
+        )
+
+        research_results = [
+            {
+                "source": item["source"],
+                "page": item["page"],
+                "text": item["text"],
+                "similarity": item["similarity"],
+            }
+            for item in retrieved
+        ]
+
+        insufficient_evidence = not bool(research_results)
+
+        research_message = (
+            "Retrieved passages require adviser verification."
+            if research_results
+            else "No relevant passages were found."
+        )
+
+    # 5. Run suitability checks.
+    suitability_request = SuitabilityRequest(
+        client=profile,
+        requested_product_category=(
+            request.requested_product_category
+        ),
+        requested_outcome=request.requested_outcome,
+        proposed_equity_allocation_pct=(
+            request.proposed_equity_allocation_pct
+        ),
+        proposed_small_cap_allocation_pct=(
+            request.proposed_small_cap_allocation_pct
+        ),
+        asks_for_guaranteed_returns=(
+            request.asks_for_guaranteed_returns
+        ),
+        asks_for_extreme_fast_returns=(
+            request.asks_for_extreme_fast_returns
+        ),
+    )
+
+    guardrail = check_suitability(suitability_request)
+
+    # 6. Prepare an adviser-facing draft.
+    supporting_facts = [
+        (
+            "Risk capacity score: "
+            f"{risk_assessment.capacity_score}/100."
+        ),
+        (
+            "Risk tolerance score: "
+            f"{risk_assessment.tolerance_score}/100."
+        ),
+        f"Risk ceiling: {risk_band}.",
+        f"Saved financial goals found: {len(goal_summaries)}.",
+    ]
+
+    for goal in goal_summaries:
+        supporting_facts.append(
+            f"Goal: {goal['goal_name']}; "
+            f"horizon: {goal['years_to_goal']} years; "
+            f"required monthly SIP estimate: "
+            f"{goal['required_monthly_sip_inr']} INR."
+        )
+
+    if insufficient_evidence:
+        supporting_facts.append(
+            "Insufficient fund-document evidence was retrieved. "
+            "Fund details and performance must not be inferred."
+        )
+
+    summary = (
+        "Adviser review draft generated using the submitted client "
+        "financial profile, risk assessment, saved financial goals, "
+        "suitability checks, and available fund research. "
+        "This is not a final investment recommendation. "
+        "The adviser must verify the client information, source "
+        "passages, product disclosures, and suitability before "
+        "making any recommendation."
+    )
+
+    draft = RecommendationDraft(
+        client_id=client_id,
+        summary=summary,
+        supporting_facts=supporting_facts,
+        source_citations=[
+            {
+                "source": item["source"],
+                "page": item["page"],
+                "similarity": item["similarity"],
+                "excerpt": item["text"],
+            }
+            for item in research_results
+        ],
+        guardrail=guardrail,
+        status="draft",
+    )
+
+    draft_result = store.create_draft(draft)
+
+    # 7. Return the complete workflow result.
+    return {
+        "client": {
+            "id": client.id,
+            "full_name": client.full_name,
+            "risk_profile": client.risk_profile,
+        },
+        "risk_assessment": risk_assessment.model_dump(
+            mode="json"
+        ),
+        "financial_goals": goal_summaries,
+        "fund_research": {
+            "question": request.research_question,
+            "results": research_results,
+            "insufficient_evidence": insufficient_evidence,
+            "message": research_message,
+        },
+        "suitability": guardrail.model_dump(
+            mode="json"
+        ),
+        "recommendation_draft": {
+            **draft_result,
+            "summary": draft.summary,
+            "supporting_facts": draft.supporting_facts,
+            "source_citations": draft.source_citations,
+            "guardrail": guardrail.model_dump(
+                mode="json"
+            ),
+        },
+        "next_action": (
+            "Verify the retrieved evidence and resolve suitability "
+            "concerns before submitting the draft for adviser review."
+        ),
+        "client_delivery_permitted": False,
+    }
+
+
+========== app\rag\api.py ==========
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
+
+from app.rag.retriever import FundRetriever
+
+router = APIRouter(prefix="/research", tags=["Fund Research"])
+
+# Shared retriever instance
+fund_retriever = FundRetriever()
+
+
+class ResearchRequest(BaseModel):
+    question: str = Field(
+        ...,
+        min_length=3,
+        max_length=500,
+        description="Question about indexed mutual fund documents"
+    )
+    top_k: int = Field(default=3, ge=1, le=10)
+
+
+@router.get("/status")
+def research_status():
+    """Check whether fund documents have been indexed."""
+
+    indexed = fund_retriever.embeddings is not None
+
+    return {
+        "indexed": indexed,
+        "chunks": len(fund_retriever.chunks),
+        "message": (
+            "Fund documents are ready."
+            if indexed
+            else "No fund documents have been indexed."
+        )
+    }
+
+
+@router.post("/search")
+def search_fund_documents(request: ResearchRequest):
+    """Retrieve relevant passages with source and page citations."""
+
+    if fund_retriever.embeddings is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Fund documents are not indexed yet."
+        )
+
+    results = fund_retriever.search(
+        query=request.question,
+        top_k=request.top_k
+    )
+
+    if not results:
+        return {
+            "question": request.question,
+            "results": [],
+            "insufficient_evidence": True,
+            "message": (
+                "No relevant passages were found in the indexed "
+                "documents. Missing financial facts must not be inferred."
+            )
+        }
+
+    return {
+        "question": request.question,
+        "results": [
+            {
+                "source": item["source"],
+                "page": item["page"],
+                "text": item["text"],
+                "similarity": item["similarity"]
+            }
+            for item in results
+        ],
+        "insufficient_evidence": False,
+        "message": (
+            "Retrieved passages require verification before "
+            "being relied upon for financial decisions."
+        )
+    }
+
+
+========== app\schemas.py ==========
+from __future__ import annotations
+
+from enum import Enum
+from typing import Literal
+
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    model_validator,
+)
+
+
+# ==================================================
+# RISK ENUMS
+# ==================================================
+
+class RiskBand(str, Enum):
+    VERY_LOW = "very_low"
+    LOW = "low"
+    MODERATE = "moderate"
+    HIGH = "high"
+    VERY_HIGH = "very_high"
+
+
+# ==================================================
+# CLIENT PROFILE
+# ==================================================
+
+class ClientProfile(BaseModel):
+    """
+    Financial and behavioural information used
+    by the risk assessment prototype.
+    """
+
+    model_config = ConfigDict(
+        use_enum_values=True,
+        extra="forbid",
+        str_strip_whitespace=True,
+    )
+
+    client_id: str = Field(
+        min_length=1,
+        max_length=100,
+    )
+
+    age: int = Field(
+        ge=18,
+        le=110,
+    )
+
+    monthly_income_inr: float = Field(
+        ge=0,
+        description="Monthly income in Indian rupees.",
+    )
+
+    income_stability: int = Field(
+        ge=1,
+        le=5,
+        description="1 = very unstable; 5 = very stable.",
+    )
+
+    monthly_essential_expenses_inr: float = Field(
+        ge=0,
+    )
+
+    monthly_debt_payments_inr: float = Field(
+        ge=0,
+    )
+
+    liquid_savings_inr: float = Field(
+        ge=0,
+    )
+
+    dependants: int = Field(
+        ge=0,
+        le=30,
+    )
+
+    goal_horizon_years: int = Field(
+        ge=1,
+        le=60,
+    )
+
+    risk_tolerance_score: int = Field(
+        ge=0,
+        le=100,
+        description="Behavioural questionnaire score.",
+    )
+
+    investment_experience_years: int = Field(
+        ge=0,
+        le=80,
+    )
+
+    recent_high_risk_losses: bool = False
+
+    notes: str | None = Field(
+        default=None,
+        max_length=2000,
+    )
+
+
+# ==================================================
+# RISK ASSESSMENT RESULT
+# ==================================================
+
+class RiskAssessment(BaseModel):
+    model_config = ConfigDict(
+        use_enum_values=True,
+        extra="forbid",
+    )
+
+    capacity_score: int = Field(
+        ge=0,
+        le=100,
+    )
+
+    tolerance_score: int = Field(
+        ge=0,
+        le=100,
+    )
+
+    capacity_band: RiskBand
+
+    tolerance_band: RiskBand
+
+    recommended_ceiling_band: RiskBand
+
+    conflict_detected: bool
+
+    resolution_rule: str
+
+    rationale: list[str] = Field(
+        min_length=1,
+    )
+
+
+# ==================================================
+# GOAL PLANNING
+# ==================================================
+
+class GoalPlanRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    goal_name: str = Field(
+        min_length=1,
+        max_length=120,
+    )
+
+    current_goal_cost_inr: float = Field(
+        gt=0,
+        description="Goal cost in today's rupees.",
+    )
+
+    years_to_goal: int = Field(
+        ge=1,
+        le=60,
+    )
+
+    current_goal_savings_inr: float = Field(
+        ge=0,
+    )
+
+    monthly_contribution_inr: float | None = Field(
+        default=None,
+        ge=0,
+    )
+
+    annual_inflation_assumption: float = Field(
+        default=0.06,
+        ge=0,
+        le=0.20,
+    )
+
+    annual_return_assumption: float = Field(
+        default=0.08,
+        ge=0,
+        le=0.30,
+    )
+
+
+class GoalPlan(BaseModel):
+    goal_name: str
+
+    years_to_goal: int
+
+    inflation_assumption: float
+
+    return_assumption: float
+
+    inflation_adjusted_target_inr: float
+
+    current_savings_future_value_inr: float
+
+    required_monthly_sip_inr: float
+
+    proposed_monthly_contribution_inr: float | None
+
+    projected_corpus_inr: float | None
+
+    projected_shortfall_inr: float | None
+
+    assumptions_and_disclosures: list[str] = Field(
+        default_factory=list,
+    )
+
+
+# ==================================================
+# SUITABILITY CHECK
+# ==================================================
+
+class SuitabilityRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    client: ClientProfile
+
+    requested_product_category: str = Field(
+        min_length=1,
+        max_length=120,
+    )
+
+    requested_outcome: str = Field(
+        default="",
+        max_length=1000,
+    )
+
+    proposed_equity_allocation_pct: float | None = Field(
+        default=None,
+        ge=0,
+        le=100,
+    )
+
+    proposed_small_cap_allocation_pct: float | None = Field(
+        default=None,
+        ge=0,
+        le=100,
+    )
+
+    asks_for_guaranteed_returns: bool = False
+
+    asks_for_extreme_fast_returns: bool = False
+
+    @model_validator(mode="after")
+    def validate_allocation(self) -> SuitabilityRequest:
+        if (
+            self.proposed_equity_allocation_pct is not None
+            and self.proposed_small_cap_allocation_pct is not None
+            and self.proposed_small_cap_allocation_pct
+            > self.proposed_equity_allocation_pct
+        ):
+            raise ValueError(
+                "Small-cap allocation cannot exceed total "
+                "proposed equity allocation."
+            )
+
+        return self
+
+
+class GuardrailResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal[
+        "allow_for_adviser_review",
+        "needs_more_information",
+        "blocked_pending_reassessment",
+    ]
+
+    flags: list[str] = Field(
+        default_factory=list,
+    )
+
+    explanation: list[str] = Field(
+        default_factory=list,
+    )
+
+    adviser_approval_required: bool = True
+
+    client_delivery_permitted: bool = False
+
+
+# ==================================================
+# RECOMMENDATION DRAFT
+# ==================================================
+
+class RecommendationDraft(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    client_id: str = Field(
+        min_length=1,
+        max_length=100,
+    )
+
+    summary: str = Field(
+        min_length=1,
+        max_length=3000,
+    )
+
+    supporting_facts: list[str] = Field(
+        default_factory=list,
+    )
+
+    source_citations: list[dict] = Field(
+        default_factory=list,
+    )
+
+    guardrail: GuardrailResult
+
+    status: Literal[
+        "draft",
+        "submitted_for_review",
+        "approved",
+        "rejected",
+    ] = "draft"
+
+
+# ==================================================
+# ADVISER APPROVAL
+# ==================================================
+
+class ApprovalAction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    adviser_id: str = Field(
+        min_length=1,
+        max_length=100,
+    )
+
+    decision: Literal[
+        "approve",
+        "reject",
+    ]
+
+    reason: str = Field(
+        min_length=3,
+        max_length=1000,
+    )
+
+
+========== app\workflow.py ==========
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from uuid import uuid4
+from .schemas import RecommendationDraft, ApprovalAction
+
+
+@dataclass
+class ApprovalStore:
+    """In-memory demo workflow. Replace with persistent DB before production."""
+    drafts: dict[str, RecommendationDraft] = field(default_factory=dict)
+    audit_log: list[dict] = field(default_factory=list)
+
+    def create_draft(self, draft: RecommendationDraft) -> dict:
+        draft_id = str(uuid4())
+        draft.status = "draft"
+        self.drafts[draft_id] = draft
+        self.audit_log.append(self._event(draft_id, "draft_created", "system", "Generated draft; not client deliverable."))
+        return {"draft_id": draft_id, "status": draft.status, "client_delivery_permitted": False}
+
+    def submit_for_review(self, draft_id: str) -> dict:
+        draft = self._get(draft_id)
+        if draft.status != "draft":
+            raise ValueError("Only a draft can be submitted for review.")
+        draft.status = "submitted_for_review"
+        self.audit_log.append(self._event(draft_id, "submitted_for_review", "system", "Sent to adviser review queue."))
+        return {"draft_id": draft_id, "status": draft.status, "client_delivery_permitted": False}
+
+    def decide(self, draft_id: str, action: ApprovalAction) -> dict:
+        draft = self._get(draft_id)
+        if draft.status != "submitted_for_review":
+            raise ValueError("Only submitted drafts can be approved or rejected.")
+        draft.status = "approved" if action.decision == "approve" else "rejected"
+        self.audit_log.append(self._event(draft_id, action.decision, action.adviser_id, action.reason))
+        # Even approved content should only be delivered by a separately authorized delivery service.
+        return {
+            "draft_id": draft_id,
+            "status": draft.status,
+            "client_delivery_permitted": False,
+            "note": "Approval recorded. Client delivery must be handled by a separate authorized service."
+        }
+
+    def _get(self, draft_id: str) -> RecommendationDraft:
+        if draft_id not in self.drafts:
+            raise KeyError("Draft not found.")
+        return self.drafts[draft_id]
+
+    @staticmethod
+    def _event(draft_id: str, event: str, actor: str, reason: str) -> dict:
+        return {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "draft_id": draft_id,
+            "event": event,
+            "actor": actor,
+            "reason": reason,
+        }
+
+
+store = ApprovalStore()
+
+
+========== app\guardrails.py ==========
+from .schemas import SuitabilityRequest, GuardrailResult
+from .risk import assess_risk, BAND_ORDER
+from .schemas import RiskBand
+
+
+def check_suitability(req: SuitabilityRequest) -> GuardrailResult:
+    flags: list[str] = []
+    explanation: list[str] = []
+    profile = req.client
+    assessment = assess_risk(profile)
+
+    if req.asks_for_guaranteed_returns or "guarantee" in req.requested_outcome.lower():
+        flags.append("GUARANTEED_RETURN_REQUEST")
+        explanation.append("Investment returns cannot be guaranteed. Replace the claim with scenario analysis and explicit risk disclosures.")
+
+    if req.asks_for_extreme_fast_returns or any(
+        phrase in req.requested_outcome.lower()
+        for phrase in ["20% guaranteed", "high returns fast", "double my money quickly", "risk-free high return"]
+    ):
+        flags.append("UNREALISTIC_RETURN_EXPECTATION")
+        explanation.append("The requested outcome may imply unrealistic or misleading return expectations; adviser discussion is required.")
+
+    if profile.age >= 65 and (req.proposed_small_cap_allocation_pct or 0) >= 80:
+        flags.append("AGE_AND_CONCENTRATION_REVIEW")
+        explanation.append("Small-cap-only or highly concentrated exposure may be inconsistent with liquidity needs and loss-bearing capacity; require a full suitability review.")
+
+    if req.proposed_equity_allocation_pct is not None:
+        if assessment.recommended_ceiling_band in (RiskBand.VERY_LOW, RiskBand.LOW) and req.proposed_equity_allocation_pct > 40:
+            flags.append("ALLOCATION_EXCEEDS_PROFILE")
+            explanation.append("Proposed equity allocation appears high relative to the conservative prototype risk-profile ceiling; adviser must reassess goals and capacity.")
+        if assessment.recommended_ceiling_band == RiskBand.VERY_LOW and req.proposed_equity_allocation_pct > 20:
+            flags.append("LOW_CAPACITY_HIGH_EQUITY")
+            explanation.append("A very-low risk profile requires additional review before material equity exposure.")
+
+    if profile.recent_high_risk_losses and req.requested_product_category.lower() in {"small_cap", "sectoral", "thematic", "derivatives", "f&o"}:
+        flags.append("RECENT_LOSSES_HIGH_RISK_REQUEST")
+        explanation.append("Recent high-risk losses plus a request for a high-risk product triggers a pause, review of objectives, and risk understanding.")
+
+    if profile.monthly_income_inr <= profile.monthly_essential_expenses_inr + profile.monthly_debt_payments_inr:
+        flags.append("NO_MONTHLY_SURPLUS")
+        explanation.append("Declared income does not exceed essential expenses plus debt payments; confirm emergency liquidity before committing to a recurring investment.")
+
+    if assessment.conflict_detected:
+        flags.append("CAPACITY_TOLERANCE_CONFLICT")
+        explanation.append("Risk capacity and behavioural tolerance differ; use the conservative ceiling and require adviser review.")
+
+    if not flags:
+        explanation.append("No hard-coded trigger fired. This does not establish suitability; adviser must review the complete client profile and product disclosures.")
+
+    if any(f in flags for f in ["GUARANTEED_RETURN_REQUEST", "UNREALISTIC_RETURN_EXPECTATION", "AGE_AND_CONCENTRATION_REVIEW", "RECENT_LOSSES_HIGH_RISK_REQUEST"]):
+        status = "blocked_pending_reassessment"
+    elif any(f in flags for f in ["ALLOCATION_EXCEEDS_PROFILE", "LOW_CAPACITY_HIGH_EQUITY", "NO_MONTHLY_SURPLUS", "CAPACITY_TOLERANCE_CONFLICT"]):
+        status = "needs_more_information"
+    else:
+        status = "allow_for_adviser_review"
+
+    return GuardrailResult(
+        status=status,
+        flags=flags,
+        explanation=explanation,
+        adviser_approval_required=True,
+        client_delivery_permitted=False,
+    )
+
+
+========== app\models.py ==========
+import uuid
+from datetime import datetime, timezone
+
+from sqlalchemy import (
+    Column,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+)
+from sqlalchemy.orm import relationship
+
+from app.database import Base
+
+
+def generate_uuid():
+    return str(uuid.uuid4())
+
+
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+class Client(Base):
+    __tablename__ = "clients"
+
+    id = Column(
+        String(36),
+        primary_key=True,
+        default=generate_uuid,
+    )
+
+    full_name = Column(String(100), nullable=False, index=True)
+    email = Column(String(255), nullable=True, unique=True, index=True)
+    phone = Column(String(20), nullable=True)
+
+    age = Column(Float, nullable=True)
+    occupation = Column(String(100), nullable=True)
+
+    annual_income = Column(Float, nullable=True)
+    monthly_expenses = Column(Float, nullable=True)
+    existing_investments = Column(Float, nullable=True)
+    emergency_fund = Column(Float, nullable=True)
+
+    risk_profile = Column(String(30), nullable=True)
+    financial_notes = Column(Text, nullable=True)
+
+    created_at = Column(
+        DateTime(timezone=True),
+        default=utc_now,
+        nullable=False,
+    )
+
+    updated_at = Column(
+        DateTime(timezone=True),
+        default=utc_now,
+        onupdate=utc_now,
+        nullable=False,
+    )
+
+    # A client can have multiple financial goals.
+    goals = relationship(
+        "FinancialGoal",
+        back_populates="client",
+        cascade="all, delete-orphan",
+    )
+
+
+class FinancialGoal(Base):
+    __tablename__ = "financial_goals"
+
+    id = Column(
+        String(36),
+        primary_key=True,
+        default=generate_uuid,
+    )
+
+    client_id = Column(
+        String(36),
+        ForeignKey("clients.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    goal_name = Column(String(120), nullable=False)
+
+    current_goal_cost_inr = Column(
+        Float,
+        nullable=False,
+    )
+
+    years_to_goal = Column(
+    Integer,
+    nullable=False,
+)
+
+    current_goal_savings_inr = Column(
+        Float,
+        nullable=False,
+        default=0,
+    )
+
+    monthly_contribution_inr = Column(
+        Float,
+        nullable=True,
+    )
+
+    annual_inflation_assumption = Column(
+        Float,
+        nullable=False,
+        default=0.06,
+    )
+
+    annual_return_assumption = Column(
+        Float,
+        nullable=False,
+        default=0.08,
+    )
+
+    # Store the latest calculated plan as JSON text.
+    plan_json = Column(
+        Text,
+        nullable=True,
+    )
+
+    created_at = Column(
+        DateTime(timezone=True),
+        default=utc_now,
+        nullable=False,
+    )
+
+    updated_at = Column(
+        DateTime(timezone=True),
+        default=utc_now,
+        onupdate=utc_now,
+        nullable=False,
+    )
+
+    client = relationship(
+        "Client",
+        back_populates="goals",
+    )
+
+
+========== app\database.py ==========
+from pathlib import Path
+
+from sqlalchemy import create_engine
+from sqlalchemy.orm import declarative_base, sessionmaker
+
+# Project root directory
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+# Store the database in the project root
+DATABASE_URL = f"sqlite:///{(BASE_DIR / 'finpilot.db').as_posix()}"
+
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={"check_same_thread": False},
+)
+
+SessionLocal = sessionmaker(
+    autocommit=False,
+    autoflush=False,
+    bind=engine,
+)
+
+Base = declarative_base()
+
+
+def get_db():
+    """Provide a database session for a FastAPI request."""
+    db = SessionLocal()
+
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+========== requirements.txt ==========
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+pydantic>=2.8,<3.0
+pytest>=8.0,<9.0
+httpx>=0.27,<1.0
