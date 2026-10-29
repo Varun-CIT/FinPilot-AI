@@ -1,139 +1,138 @@
 # FinPilot AI
 
-### AI-Powered Financial Planning, Risk Assessment & Adviser Decision Support
+### Intelligent Financial Planning, Risk Assessment & Adviser Decision Support
 
-FinPilot AI is an AI-powered financial planning and decision-support platform designed to make financial recommendations more personalized, transparent, and responsible. It combines client profiling, financial risk assessment, goal-based planning, research retrieval, suitability guardrails, and human adviser oversight in a unified application.
+FinPilot AI is an AI-powered financial planning and decision-support platform designed to make financial recommendations more personalized, transparent, and responsible. By combining financial risk assessment, goal-based planning, AI-assisted research, investment suitability guardrails, and human adviser oversight, the platform supports informed financial decision-making.
 
-The platform aims to help financial advisers evaluate client circumstances, understand investment suitability, explore relevant financial research, and prepare evidence-backed recommendations while keeping human review at the center of the decision-making process.
+FinPilot AI brings financial analysis and research into a unified workflow, helping advisers evaluate client circumstances, understand investment suitability, and prepare evidence-informed recommendations.
 
 ---
 
 ## Key Features
 
-### 1. Client Profile Management
+### 📊 1. Intelligent Client Profiling
 
-* Create, retrieve, update, and delete client profiles.
-* Capture financial information, including monthly income, essential expenses, debt payments, liquid savings, and dependants.
-* Record investment experience, risk tolerance, and financial goal horizons.
-* Maintain client information for personalized financial assessments.
+* Create and manage client financial profiles.
+* Capture income, expenses, debt obligations, savings, and dependants.
+* Record investment experience, risk tolerance, and financial goals.
+* Support personalized financial assessments using client-specific information.
 
-### 2. Financial Risk Assessment
+### 📈 2. Financial Risk Assessment
 
-* Evaluate financial risk capacity and risk tolerance.
-* Generate capacity and tolerance scores.
+* Evaluate financial risk capacity and risk tolerance separately.
+* Generate risk capacity and tolerance scores.
 * Identify conflicts between financial capacity and stated risk tolerance.
 * Determine a recommended risk ceiling.
-* Provide explanations and rationale for risk assessment outcomes.
+* Provide explanations and rationales for risk assessment outcomes.
 
-### 3. Goal-Based Financial Planning
+### 🎯 3. Goal-Based Financial Planning
 
-* Create financial plans for individual financial goals.
+* Create personalized plans for financial goals.
 * Account for inflation and assumed investment returns.
-* Calculate inflation-adjusted target amounts.
+* Calculate inflation-adjusted financial targets.
 * Estimate the future value of existing savings.
-* Calculate required monthly SIP contributions.
-* Compare projected corpus values against financial targets.
-* Generate an investment glide path based on the investment horizon.
+* Calculate required monthly Systematic Investment Plan (SIP) contributions.
+* Compare projected corpus values with financial targets.
+* Generate investment glide paths based on investment horizons.
 
-### 4. AI-Assisted Financial Research
+### 🤖 4. AI-Assisted Financial Research
 
-* Search an indexed collection of financial research documents.
-* Retrieve relevant passages for a research question.
-* Return source information and page references where available.
-* Provide similarity scores for retrieved passages.
-* Identify cases where the available evidence is insufficient.
+* Search indexed financial research documents.
+* Retrieve relevant passages based on user queries.
+* Provide source and page information where available.
+* Use similarity scores to help assess retrieval relevance.
+* Identify situations where available research evidence is insufficient.
 
-The research component uses a retrieval-based architecture. Its results depend on the documents available in the research index.
+The research component uses a Retrieval-Augmented Generation (RAG) architecture to support evidence-informed financial analysis.
 
-### 5. Suitability Assessment and Guardrails
+### 🛡️ 5. Investment Suitability & Guardrails
 
 * Evaluate proposed investment categories and allocations against client circumstances.
-* Detect requests involving guaranteed returns or unrealistic expectations of rapid returns.
-* Check proposed equity and small-cap allocations.
-* Identify cases requiring additional information or reassessment.
-* Require adviser review before recommendations are delivered to clients.
+* Identify requests involving guaranteed returns or unrealistic expectations.
+* Validate proposed equity and small-cap allocations.
+* Flag situations requiring additional information or reassessment.
+* Incorporate adviser approval requirements into recommendation workflows.
 
-### 6. Adviser Review Workflow
+### 👨‍💼 6. Human-in-the-Loop Adviser Workflow
 
-* Combine client information, risk assessments, financial goals, research, and suitability checks.
+* Combine client profiles, risk assessments, financial goals, research, and suitability checks.
 * Generate recommendation drafts for adviser review.
-* Support draft submission and adviser approval or rejection.
-* Record decisions and reasons for review.
-* Maintain an audit trail for accountability.
+* Support submission of drafts for review.
+* Record adviser approval or rejection decisions and their reasons.
+* Maintain an audit trail to support accountability.
 
-**Important:** Recommendation drafts are intended for adviser review. The workflow does not automatically authorize client delivery.
+**Design principle:** AI assists financial decision-making; adviser oversight remains central to the recommendation process.
 
 ---
 
 ## System Architecture
 
-FinPilot AI uses a frontend-backend architecture.
+FinPilot AI follows a modular, API-driven architecture.
 
 ```text
-                    ┌────────────────────────┐
-                    │       User / Adviser   │
-                    └────────────┬───────────┘
-                                 │
-                                 ▼
-                    ┌────────────────────────┐
-                    │     Next.js Frontend   │
-                    │                        │
-                    │ Dashboard and UI       │
-                    │ Client Management      │
-                    │ Risk and Goal Views    │
-                    │ Research and Reviews   │
-                    └────────────┬───────────┘
-                                 │
-                           REST API / HTTP
-                                 │
-                                 ▼
-                    ┌────────────────────────┐
-                    │    FastAPI Backend     │
-                    │                        │
-                    │ Client Services        │
-                    │ Risk Assessment        │
-                    │ Goal Planning          │
-                    │ Suitability Guardrails │
-                    │ Research Retrieval     │
-                    │ Adviser Workflow       │
-                    └────────────┬───────────┘
-                                 │
-                    ┌────────────┴────────────┐
-                    ▼                         ▼
-          ┌──────────────────┐     ┌──────────────────┐
-          │ Database Layer   │     │ Research / RAG   │
-          │                  │     │                  │
-          │ Client and Goal  │     │ Document Loading │
-          │ Records          │     │ Retrieval        │
-          └──────────────────┘     └──────────────────┘
+                 ┌──────────────────────────┐
+                 │      User / Adviser      │
+                 └────────────┬─────────────┘
+                              │
+                              ▼
+                 ┌──────────────────────────┐
+                 │      Next.js Frontend    │
+                 │                          │
+                 │ Dashboard                │
+                 │ Client Management        │
+                 │ Risk Assessment          │
+                 │ Financial Goals          │
+                 │ Research & Recommendations│
+                 │ Adviser Review           │
+                 └────────────┬─────────────┘
+                              │
+                         REST APIs
+                              │
+                              ▼
+                 ┌──────────────────────────┐
+                 │      FastAPI Backend     │
+                 │                          │
+                 │ Client Services          │
+                 │ Risk Assessment Engine   │
+                 │ Goal Planning Services   │
+                 │ Suitability Guardrails   │
+                 │ Research Retrieval       │
+                 │ Advisory Workflow        │
+                 └────────────┬─────────────┘
+                              │
+                    ┌─────────┴─────────┐
+                    ▼                   ▼
+          ┌──────────────────┐ ┌──────────────────┐
+          │ Database Layer   │ │ Research / RAG   │
+          │                  │ │                  │
+          │ Client Records   │ │ Document Loading │
+          │ Financial Goals  │ │ Retrieval        │
+          │ Workflow Data    │ │ Evidence Sources │
+          └──────────────────┘ └──────────────────┘
 ```
 
-The diagram represents the intended logical architecture. The actual availability and integration of individual components depend on the configured environment.
+The architecture separates the presentation layer, business logic, financial assessment services, and research retrieval components to support modular development and maintainability.
 
 ---
 
 ## Technology Stack
 
-| Component             | Technology                           |
-| --------------------- | ------------------------------------ |
-| Frontend framework    | Next.js                              |
-| Frontend language     | TypeScript / JavaScript              |
-| Backend framework     | FastAPI                              |
-| Backend language      | Python                               |
-| API architecture      | REST APIs                            |
-| Data validation       | Pydantic                             |
-| Financial planning    | Python-based calculation services    |
-| Research architecture | Retrieval-Augmented Generation (RAG) |
-| Testing               | Pytest and Python test modules       |
-| Version control       | Git and GitHub                       |
+| Layer                 | Technologies                                     |
+| --------------------- | ------------------------------------------------ |
+| Frontend              | Next.js, React, TypeScript / JavaScript          |
+| Backend               | Python, FastAPI                                  |
+| API communication     | REST APIs, HTTP                                  |
+| Data validation       | Pydantic                                         |
+| Financial analysis    | Python-based calculation and assessment services |
+| Research architecture | Retrieval-Augmented Generation (RAG)             |
+| Testing               | Pytest and Python test modules                   |
+| Version control       | Git, GitHub                                      |
 
-The database implementation, vector retrieval dependencies, and any external AI model integrations depend on the backend configuration.
+Database and research-retrieval implementations are configured through the backend application and its dependencies.
 
 ---
 
 ## Project Structure
-
-The repository is organized into separate frontend and backend directories.
 
 ```text
 FinPilot-AI/
@@ -174,9 +173,7 @@ FinPilot-AI/
 
 ### Prerequisites
 
-Install the following before running the application:
-
-* Python 3.11 or another Python version supported by the backend dependencies.
+* Python 3.11 or another version supported by the backend dependencies.
 * Node.js and npm.
 * Git.
 * A modern web browser.
@@ -190,9 +187,7 @@ cd FinPilot-AI
 
 ### 2. Set Up the Backend
 
-Open a terminal in the repository root.
-
-On Windows PowerShell:
+Open a terminal:
 
 ```powershell
 cd backend
@@ -206,39 +201,25 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-If PowerShell blocks virtual-environment activation, use an alternative terminal or activate the environment using the appropriate command for your shell.
-
-Start the FastAPI server:
+Start the backend server:
 
 ```powershell
 python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-The backend should be available at:
+The backend exposes the following endpoints:
 
-* **API base URL:** `http://127.0.0.1:8000`
-* **Interactive API documentation:** `http://127.0.0.1:8000/docs`
-* **Health endpoint:** `http://127.0.0.1:8000/health`
+| Resource                      | URL                            |
+| ----------------------------- | ------------------------------ |
+| API base                      | `http://127.0.0.1:8000`        |
+| Interactive API documentation | `http://127.0.0.1:8000/docs`   |
+| Health check                  | `http://127.0.0.1:8000/health` |
 
-Verify that the backend is running:
+To verify the backend:
 
 ```powershell
 Invoke-RestMethod -Uri "http://127.0.0.1:8000/health"
 ```
-
-An expected successful response resembles:
-
-```json
-{
-  "status": "ok",
-  "service": "finpilot-core",
-  "version": "0.4.0"
-}
-```
-
-Actual output may differ by backend version.
-
-**Configuration note:** Additional environment variables, database initialization, or research-index setup may be required depending on the installed dependencies and application configuration.
 
 ### 3. Set Up the Frontend
 
@@ -250,147 +231,122 @@ cd frontend
 npm install
 ```
 
-Configure the backend API URL if the frontend requires it.
-
-Create a `.env.local` file in the frontend directory:
+Configure the backend URL in a `.env.local` file inside the frontend directory:
 
 ```env
 NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:8000
 ```
 
-Start the development server:
+Start the frontend:
 
 ```powershell
 npm run dev
 ```
 
-Open the local URL printed in the terminal, usually:
+Open the local URL displayed in the terminal, usually:
 
 `http://localhost:3000`
 
-Keep both development servers running while testing the application.
+Keep both servers running during local development.
+
+**Configuration note:** Database initialization, environment variables, research-document indexing, or additional dependencies may be required depending on the selected backend features.
 
 ---
 
-## API Overview
+## API Endpoints
 
-The backend exposes REST endpoints for the platform's main operations.
+The FastAPI backend provides endpoints for the platform's core operations.
 
-| Method | Endpoint                                 | Purpose                             |
-| ------ | ---------------------------------------- | ----------------------------------- |
-| GET    | `/health`                                | Check backend availability          |
-| GET    | `/clients`                               | Retrieve client records             |
-| POST   | `/clients`                               | Create a client                     |
-| GET    | `/clients/{client_id}`                   | Retrieve a client                   |
-| PATCH  | `/clients/{client_id}`                   | Update a client                     |
-| DELETE | `/clients/{client_id}`                   | Delete a client                     |
-| POST   | `/risk/assess`                           | Assess financial risk               |
-| POST   | `/goals/plan`                            | Calculate a financial goal plan     |
-| GET    | `/goals/glide-path`                      | Generate an investment glide path   |
-| GET    | `/research/status`                       | Check research-index status         |
-| POST   | `/research/search`                       | Search indexed research             |
-| POST   | `/suitability/check`                     | Evaluate investment suitability     |
-| GET    | `/clients/{client_id}/goals`             | Retrieve a client's financial goals |
-| POST   | `/clients/{client_id}/goals`             | Create a financial goal             |
-| POST   | `/clients/{client_id}/advisory-workflow` | Run the advisory workflow           |
-| POST   | `/adviser/drafts`                        | Create an adviser draft             |
-| GET    | `/adviser/audit-log`                     | Retrieve adviser audit records      |
+| Method   | Endpoint                                 | Description                       |
+| -------- | ---------------------------------------- | --------------------------------- |
+| `GET`    | `/health`                                | Check backend health              |
+| `GET`    | `/clients`                               | Retrieve clients                  |
+| `POST`   | `/clients`                               | Create a client                   |
+| `GET`    | `/clients/{client_id}`                   | Retrieve a client profile         |
+| `PATCH`  | `/clients/{client_id}`                   | Update a client profile           |
+| `DELETE` | `/clients/{client_id}`                   | Delete a client                   |
+| `POST`   | `/risk/assess`                           | Assess financial risk             |
+| `POST`   | `/goals/plan`                            | Calculate a financial goal plan   |
+| `GET`    | `/goals/glide-path`                      | Generate an investment glide path |
+| `GET`    | `/research/status`                       | Retrieve research-index status    |
+| `POST`   | `/research/search`                       | Search indexed research           |
+| `POST`   | `/suitability/check`                     | Evaluate investment suitability   |
+| `GET`    | `/clients/{client_id}/goals`             | Retrieve client financial goals   |
+| `POST`   | `/clients/{client_id}/goals`             | Create a financial goal           |
+| `POST`   | `/clients/{client_id}/advisory-workflow` | Run the advisory workflow         |
+| `POST`   | `/adviser/drafts`                        | Create a recommendation draft     |
+| `GET`    | `/adviser/audit-log`                     | Retrieve adviser audit records    |
 
-Additional endpoints support retrieving, updating, deleting, submitting, and reviewing financial goals and recommendation drafts.
+Additional endpoints support financial goal updates, recommendation submission, and adviser decisions.
 
-For the authoritative request schemas, response models, and available operations, run the backend and visit `/docs`.
+Refer to the interactive API documentation at `/docs` for request schemas, response models, and available operations.
 
 ---
 
-## Responsible AI and Human Oversight
+## Responsible AI & Financial Safety
 
-Financial decisions can have significant consequences. FinPilot AI is designed around several safeguards:
+FinPilot AI incorporates design principles intended to support responsible financial decision-making.
 
-* **Risk awareness:** Financial capacity and risk tolerance are evaluated separately.
-* **Suitability checks:** Proposed investments are assessed against relevant client information.
-* **Evidence-based research:** Research retrieval can provide source passages to support adviser analysis.
-* **Uncertainty handling:** Insufficient research evidence should be identified rather than treated as conclusive.
-* **Human oversight:** Recommendation drafts require adviser review.
-* **Auditability:** Adviser decisions and their stated reasons can be recorded.
-* **Controlled delivery:** Generating a recommendation draft does not itself authorize delivery to a client.
+* **Risk-aware analysis:** Separates financial capacity from stated risk tolerance.
+* **Suitability checks:** Evaluates proposed investment allocations against client circumstances.
+* **Research-backed analysis:** Retrieves relevant supporting evidence from indexed documents.
+* **Uncertainty awareness:** Identifies cases where available evidence may be insufficient.
+* **Human oversight:** Routes recommendation drafts through adviser review.
+* **Auditability:** Records adviser decisions and their stated reasons.
+* **Controlled recommendations:** Distinguishes recommendation generation from approval for client delivery.
 
-These mechanisms support responsible decision-making but do not guarantee that every assessment or recommendation will be correct.
+These safeguards support informed decision-making but do not eliminate financial, data, or model-related risks.
 
 ---
 
 ## Testing
 
-The backend repository contains automated tests and additional research-related test modules.
+The backend includes test modules for core functionality.
 
-From the backend directory, run:
+Run the test suite from the backend directory:
 
 ```powershell
 python -m pytest
 ```
 
-The result depends on the installed dependencies, configured database, and available test fixtures.
+Use the interactive API documentation for manual endpoint testing:
 
-For manual API testing, use the interactive Swagger UI:
+`http://127.0.0.1:8000/docs`
 
-```text
-http://127.0.0.1:8000/docs
-```
-
-Test the backend independently before evaluating frontend-backend integration.
+Testing outcomes may depend on installed dependencies, configured services, database initialization, and available research documents.
 
 ---
 
-## Current Project Status
+## Future Scope
 
-FinPilot AI includes backend services for client management, risk assessment, goal planning, research retrieval, suitability checks, and adviser review workflows, together with a Next.js frontend.
+Potential enhancements include:
 
-The following should be verified in the target environment before claiming full end-to-end functionality:
-
-* Frontend-backend connectivity.
-* Client creation and retrieval.
-* Risk assessment results displayed in the frontend.
-* Financial goal creation and retrieval.
-* Availability of indexed research documents.
-* Recommendation draft submission and adviser decisions.
-* Persistence of records and audit events.
-* Successful installation from a clean environment.
-
-**Implementation status:** Individual backend capabilities are present in the codebase. The completeness of their frontend integration and their behavior in a fresh deployment must be verified.
-
----
-
-## Future Enhancements
-
-Potential improvements include:
-
-* Automated integration testing across the frontend and backend.
-* More comprehensive financial-planning scenarios.
-* Stronger evaluation of recommendation quality and research relevance.
-* Improved observability and error handling.
-* Authentication and role-based access control.
+* Expanded financial planning scenarios.
+* More comprehensive research-source coverage.
+* Improved evaluation of research relevance and recommendation quality.
+* Automated frontend-backend integration testing.
+* Enhanced authentication and role-based access control.
+* Advanced monitoring, logging, and observability.
 * Additional security and privacy controls.
-* Deployment configuration for a production environment.
-* Expanded audit reporting and evaluation of model outputs.
-
-These are potential enhancements, not claims about currently implemented functionality.
+* Deployment automation and production infrastructure.
+* Expanded financial analytics and reporting.
 
 ---
 
 ## Disclaimer
 
-FinPilot AI is a software project intended for financial-planning assistance, research exploration, and adviser decision support.
+FinPilot AI is intended for financial-planning assistance, research exploration, and adviser decision support. It does not replace qualified financial advice.
 
-It is not a substitute for professional financial advice. Financial calculations and research results depend on their inputs, assumptions, data quality, and implementation. Investment returns are not guaranteed, and past performance does not predict future results.
+Financial projections depend on assumptions, input data, and calculation methods. Investment returns are not guaranteed, and past performance does not predict future results.
 
-Do not use the platform for real financial decisions without appropriate validation, security controls, and qualified human review.
+The platform should not be used for consequential financial decisions without appropriate validation, security controls, and qualified human review.
 
 ---
 
-## Author and Repository
+## Repository
 
-**GitHub Repository:**
-https://github.com/Varun-CIT/FinPilot-AI
+**GitHub:** https://github.com/Varun-CIT/FinPilot-AI
 
-**Project:** FinPilot AI — AI-Powered Financial Planning and Adviser Decision Support
+**Project:** FinPilot AI — Intelligent Financial Planning and Adviser Decision Support
 
-Built using Next.js, FastAPI, and Python.
+**Core technologies:** Next.js · FastAPI · Python · REST APIs · RAG
